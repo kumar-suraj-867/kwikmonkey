@@ -10,7 +10,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 import config
-from auth import get_valid_token, run_auth_flow, load_token, validate_token, save_token
+from auth import get_valid_token, run_auth_flow, load_token, validate_token, save_token, generate_auth_url, generate_token
 from backtest_ui import render_backtest_tab
 from paper_trading_ui import render_paper_trading_tab
 from data_fetcher import FyersDataFetcher
@@ -113,46 +113,59 @@ def _fetch_shared_data(fetcher: FyersDataFetcher, strike_count: int,
 # ======================================================================
 
 def check_auth() -> str | None:
-    """Return valid token or show auth UI."""
+    """Return valid token or show auth UI with in-app OAuth."""
     token = load_token()
     if token:
         valid, err = validate_token(token)
         if valid:
             return token
-        st.warning(f"Fyers token found but validation failed: {err}")
-    else:
-        st.warning("Fyers API token not found. Please authenticate.")
+        st.warning(f"Token expired or invalid: {err}")
 
-    with st.expander("Authentication", expanded=True):
-        st.markdown("""
-        **Steps to authenticate:**
+    # ---- In-app OAuth flow ----
+    if not config.FYERS_APP_ID or not config.FYERS_SECRET_KEY:
+        st.error("FYERS_APP_ID and FYERS_SECRET_KEY must be set in Streamlit secrets or .env")
+        return None
 
-        **Option A — Cloud / Streamlit Secrets:**
-        1. Run `python auth.py` locally to get a token
-        2. Add `FYERS_ACCESS_TOKEN = "your_token"` to Streamlit secrets (or `.env`)
-        3. Refresh this page
+    st.info("Please log in to Fyers to start the dashboard.")
 
-        **Option B — Local development:**
-        1. Create an app at [myapi.fyers.in](https://myapi.fyers.in/dashboard)
-        2. Set your credentials in `.env` file
-        3. Run `python auth.py` in terminal
-        4. Refresh this page
-        """)
+    # Step 1: generate login link
+    try:
+        auth_url = generate_auth_url()
+    except Exception as e:
+        st.error(f"Failed to generate auth URL: {e}")
+        return None
 
-        # Allow pasting token directly in the UI
-        pasted_token = st.text_input(
-            "Or paste your access token here:",
-            type="password",
-            key="auth_token_input",
-        )
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("Save & Connect") and pasted_token.strip():
-                save_token(pasted_token.strip())
+    st.markdown(f"### Step 1: [Click here to log in to Fyers]({auth_url})")
+    st.markdown(
+        "After logging in, you'll be redirected to a URL. "
+        "Copy the **entire redirect URL** (or just the `auth_code` parameter) and paste it below."
+    )
+
+    # Step 2: user pastes redirect URL or auth_code
+    user_input = st.text_input(
+        "Step 2: Paste redirect URL or auth_code here",
+        key="auth_code_input",
+    )
+
+    if st.button("Connect", key="auth_connect_btn") and user_input.strip():
+        raw = user_input.strip()
+        # Extract auth_code from URL if full URL was pasted
+        if "auth_code=" in raw:
+            try:
+                from urllib.parse import urlparse, parse_qs
+                parsed = parse_qs(urlparse(raw).query)
+                raw = parsed.get("auth_code", [raw])[0]
+            except Exception:
+                pass
+
+        with st.spinner("Exchanging auth code for token..."):
+            try:
+                access_token = generate_token(raw)
+                st.session_state["_fyers_token"] = access_token
+                st.success("Authenticated successfully!")
                 st.rerun()
-        with col2:
-            if st.button("I've completed authentication — Refresh"):
-                st.rerun()
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
 
     return None
 

@@ -48,8 +48,17 @@ def save_token(token: str) -> None:
 
 
 def load_token() -> str | None:
-    """Load access token from secrets, env, or file."""
-    # 1. Streamlit secrets / env var (best for cloud deployment)
+    """Load access token from session state, secrets, env, or file."""
+    # 0. Streamlit session state (in-app OAuth flow)
+    try:
+        import streamlit as st
+        sess_token = st.session_state.get("_fyers_token", "")
+        if sess_token:
+            return sess_token
+    except Exception:
+        pass
+
+    # 1. Streamlit secrets / env var (cloud deployment)
     try:
         import streamlit as st
         if "FYERS_ACCESS_TOKEN" in st.secrets:
