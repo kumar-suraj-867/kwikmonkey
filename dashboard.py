@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import time as dt_time
 
 import config
 from auth import get_valid_token, run_auth_flow, load_token, validate_token, save_token, generate_auth_url, generate_token
@@ -218,9 +217,6 @@ def render_sidebar(fetcher: FyersDataFetcher) -> dict:
 
         st.divider()
         st.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
-
-        if st.button("🔄 Manual Refresh"):
-            st.rerun()
 
     return {
         "refresh_sec": refresh_sec,
@@ -1973,19 +1969,18 @@ def main():
         options_symbol=profile["options_symbol"],
     )
 
-    # Sidebar must render outside the fragment (fragments can't write to sidebar)
     settings = render_sidebar(fetcher)
-    st.session_state["_refresh_sec"] = settings["refresh_sec"]
 
-    # Dashboard uses st.fragment for auto-refresh without freezing the whole page
     with tab_dashboard:
         refresh_sec = settings["refresh_sec"]
 
         @st.fragment(run_every=timedelta(seconds=refresh_sec))
-        def _live_dashboard():
+        def _live_fragment():
+            # Clear stale cache so fragment fetches fresh data
+            st.session_state.pop("_shared_data", None)
             render_dashboard(fetcher, settings)
 
-        _live_dashboard()
+        _live_fragment()
 
     with tab_backtest:
         render_backtest_tab(fetcher)
