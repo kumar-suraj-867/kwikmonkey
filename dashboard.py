@@ -1966,9 +1966,8 @@ def main():
         st.divider()
 
     # Create tabs FIRST so they're always visible
-    tab_dashboard, tab_backtest, tab_paper = st.tabs(
-        ["Live Dashboard", "Backtest", "Paper Trading"]
-    )
+    tabs = st.tabs(["Live Dashboard", "Backtest", "Paper Trading", "DB Migration"])
+    tab_dashboard, tab_backtest, tab_paper, tab_migrate = tabs
 
     # Auth (shared across both tabs)
     token = check_auth()
@@ -1991,6 +1990,142 @@ def main():
 
     with tab_paper:
         render_paper_trading_tab(fetcher)
+
+    with tab_migrate:
+        _render_migration_tab()
+
+
+def _render_migration_tab():
+    """Upload local SQLite DB and migrate data to remote PostgreSQL."""
+    from data_store import USE_POSTGRES, _connect
+    from paper_trading import init_paper_tables
+
+    st.subheader("Migrate SQLite to PostgreSQL")
+
+    if not USE_POSTGRES:
+        st.warning("No DATABASE_URL configured. Migration only works when PostgreSQL is active.")
+        return
+
+    st.info("Upload your local `market_data.db` file to copy all data to the remote database.")
+
+    uploaded = st.file_uploader("Upload market_data.db", type=["db"])
+    if not uploaded:
+        return
+
+    if not st.button("Start Migration", type="primary"):
+        return
+
+    import sqlite3
+    import tempfile
+
+    # Save uploaded file to temp location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+        tmp.write(uploaded.read())
+        tmp_path = tmp.name
+
+    try:
+        lite = sqlite3.connect(tmp_path)
+        progress = st.progress(0, text="Starting...")
+
+        # --- Ensure PG tables exist ---
+        progress.progress(5, text="Creating tables...")
+        from data_store import init_db
+        init_db()
+        init_paper_tables()
+
+        # --- option_snapshots ---
+        progress.progress(10, text="Reading option_snapshots...")
+        rows = lite.execute(
+            "SELECT ts, expiry_date, strike, option_type, ltp, bid, ask, "
+            "oi, prev_oi, volume, iv, spot_price FROM option_snapshots"
+        ).fetchall()
+        if rows:
+            BATCH = 500
+            with _connect() as conn:
+                for i in range(0, len(rows), BATCH):
+                    batch = rows[i:i + BATCH]
+                    conn.executemany(
+                        "INSERT INTO option_snapshots "
+                        "(ts, expiry_date, strike, option_type, ltp, bid, ask, "
+                        "oi, prev_oi, volume, iv, spot_price) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT (ts, strike, option_type, expiry_date) DO NOTHING",
+                        batch,
+                    )
+                    pct = 10 + int(60 * min(i + BATCH, len(rows)) / len(rows))
+                    progress.progress(pct, text=f"option_snapshots: {min(i+BATCH, len(rows))}/{len(rows)}")
+        st.write(f"option_snapshots: {len(rows)} rows processed")
+
+        # --- spot_snapshots ---
+        progress.progress(72, text="Migrating spot_snapshots...")
+        rows = lite.execute(
+            'SELECT ts, ltp, "open", high, low, prev_close FROM spot_snapshots'
+        ).fetchall()
+        if rows:
+            with _connect() as conn:
+                conn.executemany(
+                    'INSERT INTO spot_snapshots (ts, ltp, "open", high, low, prev_close) '
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (ts) DO NOTHING",
+                    rows,
+                )
+        st.write(f"spot_snapshots: {len(rows)} rows processed")
+
+        # --- paper_trades ---
+        progress.progress(82, text="Migrating paper_trades...")
+        lite_cols = [c[1] for c in lite.execute("PRAGMA table_info(paper_trades)").fetchall()]
+        has_lot_size = "lot_size" in lite_cols
+        if has_lot_size:
+            select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
+                      "option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
+                      "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
+            insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
+                      "strike, option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
+                      "exit_reason, sl_price, target_price, status, pnl, notes) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
+        else:
+            select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
+                      "option_type, action, lots, entry_price, exit_time, exit_price, "
+                      "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
+            insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
+                      "strike, option_type, action, lots, entry_price, exit_time, exit_price, "
+                      "exit_reason, sl_price, target_price, status, pnl, notes) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
+        rows = lite.execute(select).fetchall()
+        if rows:
+            with _connect() as conn:
+                conn.executemany(insert, rows)
+        st.write(f"paper_trades: {len(rows)} rows processed")
+
+        # --- paper_account ---
+        progress.progress(92, text="Migrating paper_account...")
+        rows = lite.execute(
+            "SELECT id, initial_capital, realized_pnl, total_trades, "
+            "winning_trades, created_at FROM paper_account"
+        ).fetchall()
+        if rows:
+            with _connect() as conn:
+                for row in rows:
+                    conn.execute(
+                        "INSERT INTO paper_account (id, initial_capital, realized_pnl, "
+                        "total_trades, winning_trades, created_at) "
+                        "VALUES (?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING", row
+                    )
+        st.write(f"paper_account: {len(rows)} rows processed")
+
+        # --- Verify ---
+        progress.progress(100, text="Verifying...")
+        with _connect() as conn:
+            for table in ["option_snapshots", "spot_snapshots", "paper_trades", "paper_account"]:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                st.write(f"PostgreSQL `{table}`: **{count}** rows")
+
+        lite.close()
+        st.success("Migration complete!")
+
+    except Exception as e:
+        st.error(f"Migration failed: {e}")
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
