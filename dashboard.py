@@ -10,7 +10,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 import config
-from auth import get_valid_token, run_auth_flow, load_token, validate_token
+from auth import get_valid_token, run_auth_flow, load_token, validate_token, save_token
 from backtest_ui import render_backtest_tab
 from paper_trading_ui import render_paper_trading_tab
 from data_fetcher import FyersDataFetcher
@@ -123,14 +123,33 @@ def check_auth() -> str | None:
     with st.expander("Authentication", expanded=True):
         st.markdown("""
         **Steps to authenticate:**
+
+        **Option A — Cloud / Streamlit Secrets:**
+        1. Run `python auth.py` locally to get a token
+        2. Add `FYERS_ACCESS_TOKEN = "your_token"` to Streamlit secrets (or `.env`)
+        3. Refresh this page
+
+        **Option B — Local development:**
         1. Create an app at [myapi.fyers.in](https://myapi.fyers.in/dashboard)
-        2. Set your credentials in `.env` file (copy from `.env.example`)
-        3. Run `python auth.py` in terminal to complete the OAuth flow
-        4. Refresh this page after authentication
+        2. Set your credentials in `.env` file
+        3. Run `python auth.py` in terminal
+        4. Refresh this page
         """)
 
-        if st.button("I've completed authentication — Refresh"):
-            st.rerun()
+        # Allow pasting token directly in the UI
+        pasted_token = st.text_input(
+            "Or paste your access token here:",
+            type="password",
+            key="auth_token_input",
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save & Connect") and pasted_token.strip():
+                save_token(pasted_token.strip())
+                st.rerun()
+        with col2:
+            if st.button("I've completed authentication — Refresh"):
+                st.rerun()
 
     return None
 

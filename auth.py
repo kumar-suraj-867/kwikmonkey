@@ -48,7 +48,19 @@ def save_token(token: str) -> None:
 
 
 def load_token() -> str | None:
-    """Load access token from file, if it exists."""
+    """Load access token from secrets, env, or file."""
+    # 1. Streamlit secrets / env var (best for cloud deployment)
+    try:
+        import streamlit as st
+        if "FYERS_ACCESS_TOKEN" in st.secrets:
+            return str(st.secrets["FYERS_ACCESS_TOKEN"])
+    except Exception:
+        pass
+    env_token = os.getenv("FYERS_ACCESS_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    # 2. Token file (local development)
     if os.path.exists(config.TOKEN_FILE):
         with open(config.TOKEN_FILE) as f:
             token = f.read().strip()
