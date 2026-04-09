@@ -1,4 +1,4 @@
-"""NIFTY 50 Options Dashboard — real-time metrics via Fyers API."""
+"""Options Trading Dashboard — real-time metrics via Fyers API."""
 
 import sys
 from datetime import datetime, timedelta
@@ -12,14 +12,21 @@ from streamlit_autorefresh import st_autorefresh
 import config
 from auth import get_valid_token, run_auth_flow, load_token, validate_token
 from backtest_ui import render_backtest_tab
+from paper_trading_ui import render_paper_trading_tab
 from data_fetcher import FyersDataFetcher
 from metrics import enrich_with_greeks, calculate_pcr, calculate_max_pain
+from history_fetcher import HistoryFetcher
+import data_store
+from price_action import (
+    detect_trend, detect_structure, compute_iv_context,
+    generate_entry_signals,
+)
 
 # ======================================================================
 # Page config
 # ======================================================================
 st.set_page_config(
-    page_title="NIFTY Options Dashboard",
+    page_title="Options Trading Dashboard",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -42,8 +49,63 @@ st.markdown("""
         border-radius: 8px;
         padding: 10px 14px;
     }
+    /* Hide st_autorefresh visible component */
+    iframe[title="streamlit_autorefresh.st_autorefresh"] {
+        display: none !important;
+        height: 0 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
+
+
+def _active_profile() -> dict:
+    """Get active index profile from session state, default to NIFTY 50."""
+    return st.session_state.get(
+        "_index_profile", config.INDEX_PROFILES["NIFTY 50"]
+    )
+
+
+# ======================================================================
+# Centralized data fetching with TTL cache
+# ======================================================================
+
+def _fetch_shared_data(fetcher: FyersDataFetcher, strike_count: int,
+                       expiry_ts: str) -> dict | None:
+    """Fetch spot + option chain once per refresh cycle and cache in session state.
+
+    Returns dict with keys: spot, chain_df, expiry_list, fetch_time.
+    Returns None on failure.
+    """
+    cache = st.session_state.get("_shared_data")
+    now = datetime.now()
+
+    # Reuse if fetched within this refresh cycle (< 2s old, same params + index)
+    index_name = _active_profile().get("name", "")
+    if cache and (now - cache["fetch_time"]).total_seconds() < 2:
+        if (cache.get("expiry_ts") == expiry_ts
+                and cache.get("strike_count") == strike_count
+                and cache.get("index_name") == index_name):
+            return cache
+
+    try:
+        spot = fetcher.get_spot_quote()
+        chain_df, expiry_list = fetcher.get_option_chain_with_expiries(
+            strike_count=strike_count, expiry_ts=expiry_ts,
+        )
+    except Exception:
+        return None
+
+    data = {
+        "spot": spot,
+        "chain_df": chain_df,
+        "expiry_list": expiry_list,
+        "fetch_time": now,
+        "expiry_ts": expiry_ts,
+        "strike_count": strike_count,
+        "index_name": index_name,
+    }
+    st.session_state["_shared_data"] = data
+    return data
 
 
 # ======================================================================
@@ -159,15 +221,15 @@ def time_to_expiry(expiry_date_str: str) -> float:
 # Spot header
 # ======================================================================
 
-def render_spot_header(spot: dict):
-    """Show NIFTY 50 spot price bar at top."""
+def render_spot_header(spot: dict, index_name: str = "NIFTY 50"):
+    """Show spot price bar at top."""
     change_color = "green" if spot["change"] >= 0 else "red"
     arrow = "▲" if spot["change"] >= 0 else "▼"
 
     col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
     with col1:
         st.markdown(
-            f"### NIFTY 50 &nbsp; **₹{spot['ltp']:,.2f}** "
+            f"### {index_name} &nbsp; **₹{spot['ltp']:,.2f}** "
             f"<span style='color:{change_color}'>{arrow} {spot['change']:+.2f} "
             f"({spot['change_pct']:+.2f}%)</span>",
             unsafe_allow_html=True,
@@ -232,7 +294,7 @@ def render_option_chain_table(df: pd.DataFrame, spot: float):
 
     st.dataframe(
         display_df.round(2),
-        use_container_width=True,
+        width="stretch",
         height=500,
     )
 
@@ -284,10 +346,11 @@ def render_oi_analysis(df: pd.DataFrame, spot: float):
         fig.update_layout(
             title="OI Distribution by Strike",
             xaxis_title="Strike", yaxis_title="Open Interest",
+            xaxis_range=[spot - 500, spot + 500],
             barmode="group", template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, key="oi_dist", width="stretch")
 
     with col_right:
         fig2 = go.Figure()
@@ -304,10 +367,11 @@ def render_oi_analysis(df: pd.DataFrame, spot: float):
         fig2.update_layout(
             title="OI Change by Strike",
             xaxis_title="Strike", yaxis_title="OI Change",
+            xaxis_range=[spot - 500, spot + 500],
             barmode="group", template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, key="oi_chg", width="stretch")
 
 
 # ======================================================================
@@ -342,10 +406,11 @@ def render_greeks(df: pd.DataFrame, spot: float):
         fig.update_layout(
             title="IV Smile / Skew",
             xaxis_title="Strike", yaxis_title="IV (%)",
+            xaxis_range=[spot - 500, spot + 500],
             template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, key="iv_smile", width="stretch")
 
     with col_right:
         # Delta curve
@@ -366,10 +431,11 @@ def render_greeks(df: pd.DataFrame, spot: float):
         fig2.update_layout(
             title="Delta by Strike",
             xaxis_title="Strike", yaxis_title="Delta",
+            xaxis_range=[spot - 500, spot + 500],
             template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, key="delta_curve", width="stretch")
 
     # Greeks table
     with st.expander("Full Greeks Table", expanded=False):
@@ -378,7 +444,7 @@ def render_greeks(df: pd.DataFrame, spot: float):
         greek_cols = [c for c in greek_cols if c in df.columns]
         st.dataframe(
             df[greek_cols].sort_values(["strike", "option_type"]),
-            use_container_width=True,
+            width="stretch",
             height=400,
         )
 
@@ -409,10 +475,11 @@ def render_volume_price(df: pd.DataFrame, spot: float):
         fig.update_layout(
             title="Volume by Strike",
             xaxis_title="Strike", yaxis_title="Volume",
+            xaxis_range=[spot - 500, spot + 500],
             barmode="group", template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, key="vol_dist", width="stretch")
 
     with col_right:
         fig2 = go.Figure()
@@ -432,15 +499,636 @@ def render_volume_price(df: pd.DataFrame, spot: float):
         fig2.update_layout(
             title="Bid-Ask Spread by Strike",
             xaxis_title="Strike", yaxis_title="Spread (₹)",
+            xaxis_range=[spot - 500, spot + 500],
             template="plotly_dark", height=400,
-            margin=dict(t=40, b=40),
+            margin=dict(t=40, b=40), uirevision="persistent",
         )
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, key="spread_curve", width="stretch")
 
 
 # ======================================================================
 # Market Intelligence — 4 Sections + Trap Detector
 # ======================================================================
+
+# ======================================================================
+# Price Action & Entry Trigger helpers
+# ======================================================================
+
+def _get_cached_spot_candles(fetcher: FyersDataFetcher) -> pd.DataFrame:
+    """Fetch 15-min spot candles (past 5 days), cached 5 minutes in session state."""
+    cache_key = "_pa_spot_candles"
+    cache_ts_key = "_pa_spot_candles_ts"
+    cache_idx_key = "_pa_spot_candles_idx"
+
+    profile = _active_profile()
+    now = datetime.now()
+    cached_ts = st.session_state.get(cache_ts_key)
+    cached_idx = st.session_state.get(cache_idx_key)
+    if (cached_ts and (now - cached_ts).total_seconds() < 300
+            and cached_idx == profile["name"]):
+        cached = st.session_state.get(cache_key)
+        if cached is not None and not cached.empty:
+            return cached
+
+    try:
+        history = HistoryFetcher(fetcher.fyers, underlying=fetcher.underlying)
+        from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        candles = history.get_spot_candles(from_date, to_date, resolution="15")
+        if not candles.empty:
+            st.session_state[cache_key] = candles
+            st.session_state[cache_ts_key] = now
+            st.session_state[cache_idx_key] = profile["name"]
+        return candles
+    except Exception:
+        return pd.DataFrame()
+
+
+def _get_historical_atm_iv(spot: float, days: int = 30) -> list[float]:
+    """Get historical ATM IV readings from local DB snapshots."""
+    try:
+        data_store.init_db()
+        from_dt = datetime.now() - timedelta(days=days)
+        to_dt = datetime.now()
+        strike_step = _active_profile()["strike_step"]
+        atm_strike = round(spot / strike_step) * strike_step
+
+        ce_hist = data_store.get_option_history(atm_strike, "CE", from_dt, to_dt)
+        pe_hist = data_store.get_option_history(atm_strike, "PE", from_dt, to_dt)
+
+        if not ce_hist.empty and not pe_hist.empty:
+            merged = pd.merge(
+                ce_hist[["ts", "iv"]], pe_hist[["ts", "iv"]],
+                on="ts", suffixes=("_ce", "_pe"),
+            )
+            if not merged.empty:
+                readings = ((merged["iv_ce"] + merged["iv_pe"]) / 2).tolist()
+                return [v for v in readings if v > 0]
+
+        for hist in (ce_hist, pe_hist):
+            if not hist.empty:
+                vals = hist["iv"].dropna().tolist()
+                return [v for v in vals if v > 0]
+
+        return []
+    except Exception:
+        return []
+
+
+def _render_price_action_section(trend_data: dict, structure_data: dict, spot: float):
+    """Render the price action analysis section."""
+    st.markdown("### 📊 Price Action")
+
+    if trend_data.get("trend") == "UNKNOWN":
+        st.info("Price action unavailable — no recent spot candles. Data loads on first refresh.")
+        return
+
+    trend = trend_data["trend"]
+    strength = trend_data.get("strength", 0)
+
+    if "UPTREND" in trend:
+        t_color, t_icon = "#22c55e", "▲"
+    elif "DOWNTREND" in trend:
+        t_color, t_icon = "#ef4444", "▼"
+    elif trend == "SIDEWAYS":
+        t_color, t_icon = "#f59e0b", "◆"
+    else:
+        t_color, t_icon = "#6b7280", "◈"
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(
+            f"<div style='text-align:center; padding:10px; border:2px solid {t_color}; "
+            f"border-radius:8px;'>"
+            f"<span style='font-size:0.8em; color:gray;'>Trend</span><br>"
+            f"<span style='color:{t_color}; font-size:1.3em; font-weight:bold;'>"
+            f"{t_icon} {trend}</span></div>",
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.metric("Trend Strength", f"{strength}/100")
+    with col3:
+        recent = trend_data.get("recent_change_pct", 0)
+        st.metric("Recent Move", f"{recent:+.2f}%")
+    with col4:
+        ema_f = trend_data.get("ema_fast", 0)
+        ema_m = trend_data.get("ema_medium", 0)
+        ema_s = trend_data.get("ema_slow", 0)
+        st.markdown(
+            f"<div style='text-align:center; padding:6px;'>"
+            f"<span style='font-size:0.8em; color:gray;'>EMA Stack</span><br>"
+            f"<span style='font-size:0.9em;'>"
+            f"<b>{ema_f:,.0f}</b> / {ema_m:,.0f} / {ema_s:,.0f}</span><br>"
+            f"<span style='font-size:0.75em; color:gray;'>Fast / Med / Slow</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    # Structure
+    struct = structure_data.get("structure", "UNCLEAR")
+    struct_detail = structure_data.get("structure_detail", "")
+
+    if "BULLISH" in struct:
+        s_color = "#22c55e"
+    elif "BEARISH" in struct:
+        s_color = "#ef4444"
+    elif struct in ("CONTRACTING", "EXPANDING"):
+        s_color = "#f59e0b"
+    else:
+        s_color = "#6b7280"
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.markdown(
+            f"<div style='padding:8px; border-left:4px solid {s_color}; "
+            f"background:rgba(255,255,255,0.03); border-radius:4px;'>"
+            f"<span style='font-size:0.8em; color:gray;'>Structure</span><br>"
+            f"<span style='color:{s_color}; font-weight:bold;'>{struct}</span></div>",
+            unsafe_allow_html=True,
+        )
+    with col2:
+        if struct_detail:
+            st.caption(struct_detail)
+        p_supports = structure_data.get("price_supports", [])
+        p_resists = structure_data.get("price_resistances", [])
+        if p_supports or p_resists:
+            sr_parts = []
+            if p_supports:
+                sr_parts.append("Support: " + ", ".join(f"₹{s:,.0f}" for s in p_supports[:3]))
+            if p_resists:
+                sr_parts.append("Resistance: " + ", ".join(f"₹{r:,.0f}" for r in p_resists[-3:]))
+            st.caption(" | ".join(sr_parts))
+
+
+def _render_iv_context_section(iv_ctx: dict, atm_iv: float):
+    """Render the volatility context section."""
+    st.markdown("### 🌡️ Volatility Context")
+
+    iv_rank = iv_ctx.get("iv_rank")
+    iv_pctile = iv_ctx.get("iv_percentile")
+    regime = iv_ctx.get("regime", "UNKNOWN")
+    action = iv_ctx.get("action", "")
+
+    if iv_rank is None:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Current ATM IV", f"{atm_iv:.1f}%")
+        with col2:
+            if atm_iv > 25:
+                st.caption("🔴 HIGH — options expensive, favor selling")
+            elif atm_iv > 15:
+                st.caption("🟡 MODERATE — options fairly priced")
+            else:
+                st.caption("🟢 LOW — options cheap, favor buying")
+        st.caption("IV Rank/Percentile requires collected data — start collecting in Backtest tab.")
+        return
+
+    regime_colors = {
+        "LOW": ("#22c55e", "🟢"), "BELOW AVG": ("#86efac", "🟢"),
+        "ABOVE AVG": ("#fbbf24", "🟡"), "HIGH": ("#ef4444", "🔴"),
+    }
+    r_color, r_icon = regime_colors.get(regime, ("#6b7280", "⚪"))
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("IV Rank", f"{iv_rank:.1f}")
+    with col2:
+        st.metric("IV Percentile", f"{iv_pctile:.1f}")
+    with col3:
+        st.markdown(
+            f"<div style='text-align:center; padding:8px; border:2px solid {r_color}; "
+            f"border-radius:8px;'>"
+            f"<span style='font-size:0.8em; color:gray;'>IV Regime</span><br>"
+            f"<span style='color:{r_color}; font-size:1.2em; font-weight:bold;'>"
+            f"{r_icon} {regime}</span></div>",
+            unsafe_allow_html=True,
+        )
+    with col4:
+        st.metric("Current IV", f"{atm_iv:.1f}%")
+    with col5:
+        iv_min = iv_ctx.get("iv_min", 0)
+        iv_max = iv_ctx.get("iv_max", 0)
+        iv_mean = iv_ctx.get("iv_mean", 0)
+        st.markdown(
+            f"<div style='text-align:center; padding:6px;'>"
+            f"<span style='font-size:0.8em; color:gray;'>30D Range</span><br>"
+            f"<span style='font-size:0.9em;'>"
+            f"{iv_min:.1f}% — <b>{iv_mean:.1f}%</b> — {iv_max:.1f}%</span></div>",
+            unsafe_allow_html=True,
+        )
+
+    if action:
+        st.markdown(
+            f"<div style='padding:8px; background:rgba(255,255,255,0.03); "
+            f"border-radius:4px; text-align:center;'>"
+            f"💡 {action}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _signal_to_legs(strategy: str, spot: float, offset: int = 200) -> list[tuple]:
+    """Map a signal strategy name to concrete option legs.
+
+    Returns list of (action, option_type, strike_offset_from_ATM) tuples.
+    Offsets are in points relative to ATM (positive = above, negative = below).
+    """
+    step = _active_profile()["strike_step"]
+    atm = round(spot / step) * step
+
+    mapping = {
+        "Long Call (ATM)":               [("BUY", "CE", 0)],
+        "Bull Call Spread":              [("BUY", "CE", 0), ("SELL", "CE", offset)],
+        "Bull Put Spread (sell put)":    [("SELL", "PE", 0), ("BUY", "PE", -offset)],
+        "Long Put (ATM)":               [("BUY", "PE", 0)],
+        "Bear Put Spread":              [("BUY", "PE", 0), ("SELL", "PE", -offset)],
+        "Bear Call Spread (sell call)":  [("SELL", "CE", 0), ("BUY", "CE", offset)],
+        "Iron Condor (sell both sides)": [
+            ("SELL", "CE", offset), ("BUY", "CE", offset + step),
+            ("SELL", "PE", -offset), ("BUY", "PE", -(offset + step)),
+        ],
+        "Long Straddle":                [("BUY", "CE", 0), ("BUY", "PE", 0)],
+    }
+
+    raw = mapping.get(strategy)
+    if not raw:
+        return []
+
+    return [(action, opt, atm + off) for action, opt, off in raw]
+
+
+def _render_entry_triggers_section(signals: list[dict],
+                                   chain_df: pd.DataFrame = None,
+                                   spot: float = 0,
+                                   expiry_date: str = ""):
+    """Render entry trigger signal cards with optional paper-trade execution."""
+    st.markdown("### 🎯 Entry Triggers")
+
+    if not signals:
+        st.info("No signals generated.")
+        return
+
+    from paper_trading import place_order as pt_place_order
+
+    for i, sig in enumerate(signals):
+        status = sig.get("status", "WAIT")
+        direction = sig.get("direction", "")
+        strategy = sig.get("strategy", "")
+        confidence = sig.get("confidence", 0)
+        reasoning = sig.get("reasoning", "")
+        entry_zone = sig.get("entry_zone", "")
+        sl = sig.get("sl", "")
+        target = sig.get("target", "")
+
+        status_styles = {
+            "ENTER": ("#22c55e", "rgba(34,197,94,0.15)", "🟢"),
+            "PREPARE": ("#3b82f6", "rgba(59,130,246,0.15)", "🔵"),
+            "ALERT": ("#f59e0b", "rgba(245,158,11,0.15)", "🟡"),
+            "WAIT": ("#6b7280", "rgba(107,114,128,0.15)", "⚪"),
+        }
+        badge_color, badge_bg, badge_icon = status_styles.get(
+            status, ("#6b7280", "rgba(107,114,128,0.15)", "⚪")
+        )
+
+        if confidence >= 70:
+            conf_color = "#22c55e"
+        elif confidence >= 50:
+            conf_color = "#3b82f6"
+        elif confidence >= 30:
+            conf_color = "#f59e0b"
+        else:
+            conf_color = "#6b7280"
+
+        # Check if this signal is executable as a paper trade
+        legs = _signal_to_legs(strategy, spot) if spot > 0 else []
+        can_execute = bool(legs) and chain_df is not None and not chain_df.empty and status in ("ENTER", "PREPARE")
+
+        # Build leg preview text
+        leg_preview = ""
+        if can_execute:
+            parts = []
+            for action, opt_type, strike in legs:
+                m = chain_df[(chain_df["strike"] == strike) & (chain_df["option_type"] == opt_type)]
+                ltp = m.iloc[0]["ltp"] if not m.empty else 0
+                parts.append(f"{action} {opt_type} {strike:.0f} @{ltp:.1f}")
+            leg_preview = " | ".join(parts)
+
+        st.markdown(
+            f"<div style='padding:14px; border:2px solid {badge_color}; "
+            f"border-radius:8px; background:{badge_bg}; margin-bottom:4px;'>"
+            f"<span style='font-size:1.5em;'>{badge_icon}</span> "
+            f"<span style='color:{badge_color}; font-size:1.3em; font-weight:bold;'>"
+            f"{status}</span> "
+            f"<span style='color:gray;'> — {direction}</span> "
+            f"<span style='float:right; color:{conf_color}; font-weight:bold;'>"
+            f"{confidence}%</span><br>"
+            f"<b>Strategy:</b> {strategy}<br>"
+            f"<span style='font-size:0.9em;'>"
+            f"Entry: <b>{entry_zone}</b> &nbsp;|&nbsp; "
+            f"SL: <b>{sl}</b> &nbsp;|&nbsp; "
+            f"Target: <b>{target}</b></span><br>"
+            f"<span style='color:gray; font-size:0.85em;'>{reasoning}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Paper trade execution button
+        if can_execute:
+            st.caption(f"Legs: {leg_preview}")
+            if st.button(f"📝 Paper Trade: {strategy}", key=f"pt_signal_{i}",
+                         type="primary"):
+                import uuid
+                group_id = uuid.uuid4().hex[:12]
+                placed = 0
+                for action, opt_type, strike in legs:
+                    m = chain_df[
+                        (chain_df["strike"] == strike) &
+                        (chain_df["option_type"] == opt_type)
+                    ]
+                    ltp = m.iloc[0]["ltp"] if not m.empty else 0
+                    if ltp > 0:
+                        pt_place_order(
+                            expiry_date=expiry_date,
+                            strike=strike,
+                            option_type=opt_type,
+                            action=action,
+                            lots=1,
+                            entry_price=ltp,
+                            strategy=strategy,
+                            group_id=group_id,
+                            notes=f"From signal: {direction} {confidence}%",
+                            lot_size=_active_profile()["lot_size"],
+                        )
+                        placed += 1
+                if placed:
+                    st.success(f"Paper trade placed: {strategy} ({placed} legs)")
+                else:
+                    st.error("No live prices available for the required strikes")
+
+
+def _render_smart_money_section(df: pd.DataFrame, spot: float):
+    """Render smart money tracking: premium flow, unusual OI, rolling, verdict."""
+    st.markdown("### 🏦 Smart Money Tracking")
+
+    calls = df[df["option_type"] == "CE"].copy()
+    puts = df[df["option_type"] == "PE"].copy()
+    profile = _active_profile()
+    lot_size = profile["lot_size"]
+
+    # ---- Classify activity per strike (label + proportional split) ----
+    # Activity label: standard OI+Price quadrant using change (ltp - prev_close)
+    # Proportional split: uses NIFTY SPOT direction instead of per-option
+    # price change, because the optionchain API doesn't provide reliable
+    # intraday open prices (often 0), and theta decay biases per-option
+    # change negative for both CE and PE.
+    #
+    # Logic: when spot goes UP →
+    #   CE fresh OI = more buyer-driven (calls gain value)
+    #   PE fresh OI = more writer-driven (put sellers collect theta)
+    # And vice versa for spot DOWN.
+
+    spot_data = st.session_state.get("_spot", {})
+    if isinstance(spot_data, dict) and spot_data.get("open", 0) > 0:
+        spot_intraday_pct = (spot_data["ltp"] - spot_data["open"]) / spot_data["open"] * 100
+    elif isinstance(spot_data, dict):
+        spot_intraday_pct = spot_data.get("change_pct", 0)
+    else:
+        spot_intraday_pct = 0
+
+    ce_buyer_frac = _buyer_fraction(spot_intraday_pct)      # spot up → high
+    pe_buyer_frac = _buyer_fraction(-spot_intraday_pct)     # spot up → low (writers)
+
+    for subset, buyer_frac in [(calls, ce_buyer_frac), (puts, pe_buyer_frac)]:
+        subset["activity"] = subset.apply(
+            lambda r: _classify_oi_action(r.get("oi_change", 0), r.get("change", 0)),
+            axis=1,
+        )
+        subset["prem_deployed"] = subset["oi_change"].abs() * subset["ltp"] * lot_size
+
+        fresh_mask = subset["oi_change"] > 0
+        subset["buyer_prem"] = 0.0
+        subset["writer_prem"] = 0.0
+        subset.loc[fresh_mask, "buyer_prem"] = (
+            subset.loc[fresh_mask, "prem_deployed"] * buyer_frac
+        )
+        subset.loc[fresh_mask, "writer_prem"] = (
+            subset.loc[fresh_mask, "prem_deployed"] * (1 - buyer_frac)
+        )
+
+    # ---- 1. Premium Flow (proportional) ----
+    # Bullish: CE buyers + PE writers (put sellers support market)
+    ce_buyer_prem = calls["buyer_prem"].sum()
+    pe_writer_prem = puts["writer_prem"].sum()
+    bullish_prem = ce_buyer_prem + pe_writer_prem
+
+    # Bearish: CE writers + PE buyers (put buyers expect decline)
+    ce_writer_prem = calls["writer_prem"].sum()
+    pe_buyer_prem = puts["buyer_prem"].sum()
+    bearish_prem = ce_writer_prem + pe_buyer_prem
+
+    writer_prem = ce_writer_prem + pe_writer_prem
+    buyer_prem = ce_buyer_prem + pe_buyer_prem
+    total_fresh = writer_prem + buyer_prem
+
+    # ---- 2. Unusual OI (z-score > 2 per type) ----
+    unusual_list = []
+    for subset in [calls, puts]:
+        oi_abs = subset["oi_change"].abs()
+        mean_oi = oi_abs.mean()
+        std_oi = oi_abs.std()
+        if std_oi > 0:
+            subset["oi_zscore"] = (oi_abs - mean_oi) / std_oi
+            unusual_list.append(subset[subset["oi_zscore"] > 2.0])
+        else:
+            subset["oi_zscore"] = 0.0
+
+    unusual = pd.concat(unusual_list).copy() if unusual_list else pd.DataFrame()
+
+    # ---- 3. Rolling detection (up to 2 strikes away) ----
+    rolls = []
+    avg_oi_chg = df["oi_change"].abs().mean()
+    for opt_type, subset in [("CE", calls), ("PE", puts)]:
+        ss = subset.sort_values("strike").reset_index(drop=True)
+        for i in range(len(ss)):
+            for j in range(i + 1, min(i + 3, len(ss))):
+                curr, nxt = ss.iloc[i], ss.iloc[j]
+                # Rolling UP: lower losing OI, higher gaining
+                if curr["oi_change"] < -avg_oi_chg and nxt["oi_change"] > avg_oi_chg:
+                    rolls.append({"type": opt_type, "from": curr["strike"],
+                                  "to": nxt["strike"], "from_chg": curr["oi_change"],
+                                  "to_chg": nxt["oi_change"], "dir": "UP"})
+                # Rolling DOWN: higher losing OI, lower gaining
+                elif nxt["oi_change"] < -avg_oi_chg and curr["oi_change"] > avg_oi_chg:
+                    rolls.append({"type": opt_type, "from": nxt["strike"],
+                                  "to": curr["strike"], "from_chg": nxt["oi_change"],
+                                  "to_chg": curr["oi_change"], "dir": "DOWN"})
+
+    # ---- 4. OI Concentration & Conviction ----
+    pos_oi = df[df["oi_change"] > 0]["oi_change"]
+    top3 = pos_oi.nlargest(3).sum() if len(pos_oi) >= 3 else pos_oi.sum()
+    total_pos = pos_oi.sum()
+    concentration = (top3 / total_pos * 100) if total_pos > 0 else 0
+
+    # Spread tightness at OI walls (institutional proxy)
+    top_oi = df.nlargest(6, "oi")
+    avg_spread_walls = top_oi["spread"].mean() if not top_oi.empty else 0
+    avg_spread_all = df["spread"].mean() if not df.empty else 1
+    tight_walls = avg_spread_walls < avg_spread_all * 0.8
+
+    # ---- 5. Smart Money Verdict ----
+    bull_pts, bear_pts = 0, 0
+    reasons = []
+
+    # a) Premium flow direction (30 pts)
+    if bullish_prem > bearish_prem * 1.3 and bullish_prem > 0:
+        bull_pts += 30
+        reasons.append(f"Bullish flow ₹{bullish_prem / 100000:,.1f}L > bearish ₹{bearish_prem / 100000:,.1f}L")
+    elif bearish_prem > bullish_prem * 1.3 and bearish_prem > 0:
+        bear_pts += 30
+        reasons.append(f"Bearish flow ₹{bearish_prem / 100000:,.1f}L > bullish ₹{bullish_prem / 100000:,.1f}L")
+
+    # b) Unusual OI skew near ATM (20 pts)
+    unusual_ce_near = calls[(calls["oi_zscore"] > 2) & (calls["strike"] <= spot + 200)] if "oi_zscore" in calls.columns else pd.DataFrame()
+    unusual_pe_near = puts[(puts["oi_zscore"] > 2) & (puts["strike"] >= spot - 200)] if "oi_zscore" in puts.columns else pd.DataFrame()
+    if len(unusual_ce_near) > len(unusual_pe_near) + 1:
+        bear_pts += 20
+        reasons.append(f"Unusual CE buildup near ATM ({len(unusual_ce_near)} strikes)")
+    elif len(unusual_pe_near) > len(unusual_ce_near) + 1:
+        bull_pts += 20
+        reasons.append(f"Unusual PE buildup near ATM ({len(unusual_pe_near)} strikes)")
+
+    # c) Rolling signals (15 pts each, max 2)
+    roll_counted = 0
+    for roll in rolls:
+        if roll_counted >= 2:
+            break
+        if roll["type"] == "CE" and roll["dir"] == "UP":
+            bull_pts += 15; roll_counted += 1
+            reasons.append(f"CE rolling UP ₹{roll['from']:,.0f}→₹{roll['to']:,.0f} (resistance higher)")
+        elif roll["type"] == "CE" and roll["dir"] == "DOWN":
+            bear_pts += 15; roll_counted += 1
+            reasons.append(f"CE rolling DOWN ₹{roll['from']:,.0f}→₹{roll['to']:,.0f} (resistance lower)")
+        elif roll["type"] == "PE" and roll["dir"] == "UP":
+            bull_pts += 15; roll_counted += 1
+            reasons.append(f"PE rolling UP ₹{roll['from']:,.0f}→₹{roll['to']:,.0f} (support higher)")
+        elif roll["type"] == "PE" and roll["dir"] == "DOWN":
+            bear_pts += 15; roll_counted += 1
+            reasons.append(f"PE rolling DOWN ₹{roll['from']:,.0f}→₹{roll['to']:,.0f} (support lower)")
+
+    # d) Writer dominance with directional bias (20 pts)
+    if writer_prem > buyer_prem * 1.5 and writer_prem > 0:
+        if pe_writer_prem > ce_writer_prem * 1.2:
+            bull_pts += 20
+            reasons.append("Put writers dominant — institutional support")
+        elif ce_writer_prem > pe_writer_prem * 1.2:
+            bear_pts += 20
+            reasons.append("Call writers dominant — institutional capping")
+
+    # e) Informational
+    if concentration > 60:
+        reasons.append(f"OI concentrated ({concentration:.0f}%) — high conviction")
+    if tight_walls:
+        reasons.append("Tight spreads at OI walls — active market-making")
+
+    if bull_pts > bear_pts + 20:
+        verdict, v_color, v_icon = "BULLISH", "#22c55e", "🟢"
+    elif bear_pts > bull_pts + 20:
+        verdict, v_color, v_icon = "BEARISH", "#ef4444", "🔴"
+    else:
+        verdict, v_color, v_icon = "NEUTRAL", "#f59e0b", "🟡"
+
+    # === RENDER ===
+
+    # Verdict badge
+    st.markdown(
+        f"<div style='text-align:center; padding:12px; border:2px solid {v_color}; "
+        f"border-radius:8px; margin-bottom:12px;'>"
+        f"<span style='font-size:0.8em; color:gray;'>Smart Money Bias</span><br>"
+        f"<span style='color:{v_color}; font-size:1.5em; font-weight:bold;'>"
+        f"{v_icon} {verdict}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Premium flow metrics
+    st.markdown("**Premium Deployed** (estimated)")
+    total_flow = bullish_prem + bearish_prem
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Bullish Flow", f"₹{bullish_prem / 100000:,.1f}L",
+                   help="CE buyers + PE writers (supporting market)")
+    with col2:
+        st.metric("Bearish Flow", f"₹{bearish_prem / 100000:,.1f}L",
+                   help="CE writers + PE buyers (capping market)")
+    with col3:
+        st.metric("Total Fresh OI", f"₹{total_fresh / 100000:,.1f}L",
+                   help="Total new premium deployed today")
+    with col4:
+        conc_label = "HIGH" if concentration > 60 else "LOW" if concentration < 30 else "MED"
+        st.metric("OI Concentration", f"{concentration:.0f}% ({conc_label})",
+                   help="Top 3 strikes as % of total new OI")
+
+    # Breakdown
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.caption(f"CE Buyers: ₹{ce_buyer_prem / 100000:,.1f}L")
+    with col2:
+        st.caption(f"CE Writers: ₹{ce_writer_prem / 100000:,.1f}L")
+    with col3:
+        st.caption(f"PE Buyers: ₹{pe_buyer_prem / 100000:,.1f}L")
+    with col4:
+        st.caption(f"PE Writers: ₹{pe_writer_prem / 100000:,.1f}L")
+
+    # Directional flow bar
+    if total_flow > 0:
+        bull_pct = bullish_prem / total_flow * 100
+        if bull_pct > 60:
+            flow_note = "Bullish flow dominant — money supporting upside"
+            flow_color = "#22c55e"
+        elif bull_pct < 40:
+            flow_note = "Bearish flow dominant — money positioning for downside"
+            flow_color = "#ef4444"
+        else:
+            flow_note = "Balanced flow — no strong directional bias"
+            flow_color = "#f59e0b"
+        st.markdown(
+            f"<div style='padding:6px; text-align:center;'>"
+            f"<span style='color:{flow_color};'>Bullish {bull_pct:.0f}% | Bearish {100 - bull_pct:.0f}%</span>"
+            f" — {flow_note}"
+            f" <span style='color:gray; font-size:0.8em;'>({profile['name']} {spot_intraday_pct:+.2f}% intraday)</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Unusual activity
+    if not unusual.empty:
+        with st.expander(f"Unusual OI Activity ({len(unusual)} strikes)", expanded=len(unusual) <= 5):
+            disp = unusual[["strike", "option_type", "oi_change", "oi", "ltp", "volume", "activity"]].copy()
+            disp.columns = ["Strike", "Type", "OI Chg", "Total OI", "LTP", "Volume", "Action"]
+            disp = disp.sort_values("OI Chg", key=abs, ascending=False).head(8)
+            num_cols = disp.select_dtypes(include="number").columns
+            disp[num_cols] = disp[num_cols].round(2)
+            st.dataframe(disp, width="stretch", hide_index=True)
+
+    # Rolling
+    if rolls:
+        with st.expander(f"Position Rolling ({len(rolls)} probable)"):
+            for roll in rolls[:5]:
+                d_icon = "⬆️" if roll["dir"] == "UP" else "⬇️"
+                if roll["type"] == "CE":
+                    impl = "resistance shifted higher" if roll["dir"] == "UP" else "resistance shifted lower"
+                else:
+                    impl = "support shifted higher" if roll["dir"] == "UP" else "support shifted lower"
+                st.markdown(
+                    f"{d_icon} **{roll['type']}** ₹{roll['from']:,.0f} → ₹{roll['to']:,.0f} "
+                    f"(OI: {roll['from_chg']:+,.0f} / {roll['to_chg']:+,.0f}) "
+                    f"<span style='color:gray;'>— {impl}</span>",
+                    unsafe_allow_html=True,
+                )
+
+    # Reasoning
+    if reasons:
+        with st.expander("Smart Money Reasoning"):
+            for r in reasons:
+                st.caption(f"• {r}")
+
 
 def _classify_oi_action(oi_change: float, price_change: float) -> str:
     """Classify OI activity into buildup/unwinding type."""
@@ -455,13 +1143,32 @@ def _classify_oi_action(oi_change: float, price_change: float) -> str:
     return "No Change"
 
 
-def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
+def _buyer_fraction(change_pct: float) -> float:
+    """Sigmoid mapping from directional signal to buyer fraction.
+
+    With k=1.0 (tuned for spot % changes, typically ±0.1 to ±2):
+      +1.0% → 0.73 buyer (73% buyer / 27% writer)
+      +0.5% → 0.62
+       0.0% → 0.50
+      -0.5% → 0.38
+      -1.0% → 0.27
+    """
+    import math
+    k = 1.0
+    # Clamp to avoid overflow in exp
+    x = max(min(change_pct * k, 10), -10)
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict,
+                               spot_candles: pd.DataFrame = None,
+                               expiry_date: str = ""):
     """Render the full market intelligence panel."""
 
     calls = df[df["option_type"] == "CE"].copy()
     puts = df[df["option_type"] == "PE"].copy()
 
-    # Classify each row
+    # Classify each row using standard OI+Price quadrant (change from prev close)
     calls["oi_action"] = calls.apply(
         lambda r: _classify_oi_action(r.get("oi_change", 0), r.get("change", 0)), axis=1
     )
@@ -491,6 +1198,35 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
     immediate_support = puts.nlargest(1, "oi")["strike"].iloc[0] if not puts.empty else 0
     immediate_resistance = calls.nlargest(1, "oi")["strike"].iloc[0] if not calls.empty else 0
     range_width = immediate_resistance - immediate_support
+
+    # --- Price action analysis (from spot candles) ---
+    if spot_candles is not None and not spot_candles.empty:
+        trend_data = detect_trend(spot_candles)
+        structure_data = detect_structure(spot_candles)
+    else:
+        trend_data = {"trend": "UNKNOWN", "strength": 0, "details": "no candle data"}
+        structure_data = {
+            "structure": "UNCLEAR", "structure_detail": "",
+            "swing_highs": [], "swing_lows": [],
+            "price_supports": [], "price_resistances": [],
+        }
+
+    # --- IV context (from local DB history) ---
+    iv_history = _get_historical_atm_iv(spot)
+    iv_ctx = compute_iv_context(atm_iv, iv_history)
+
+    # --- Entry trigger signals ---
+    entry_signals = generate_entry_signals(
+        trend=trend_data,
+        structure=structure_data,
+        iv_ctx=iv_ctx,
+        pcr_oi=pcr_oi,
+        spot=spot,
+        oi_support=immediate_support,
+        oi_resistance=immediate_resistance,
+        atm_iv=atm_iv,
+        max_pain=max_pain,
+    )
 
     # Volatility regime
     if atm_iv > 25:
@@ -580,6 +1316,13 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
     st.divider()
 
     # ==================================================================
+    # 📊 PRICE ACTION
+    # ==================================================================
+    _render_price_action_section(trend_data, structure_data, spot)
+
+    st.divider()
+
+    # ==================================================================
     # 🟡 SECTION 2: LEVELS
     # ==================================================================
     st.markdown("### 🟡 Key Levels")
@@ -627,13 +1370,20 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
         support_df = top_put_oi.copy()
         support_df.columns = ["Strike", "Put OI"]
         support_df["Distance"] = spot - support_df["Strike"]
-        st.dataframe(support_df.round(0), use_container_width=True, hide_index=True)
+        st.dataframe(support_df.round(0), width="stretch", hide_index=True)
     with col2:
         st.markdown("**Resistance Levels (Call OI)**")
         resist_df = top_call_oi.copy()
         resist_df.columns = ["Strike", "Call OI"]
         resist_df["Distance"] = resist_df["Strike"] - spot
-        st.dataframe(resist_df.round(0), use_container_width=True, hide_index=True)
+        st.dataframe(resist_df.round(0), width="stretch", hide_index=True)
+
+    st.divider()
+
+    # ==================================================================
+    # 🌡️ VOLATILITY CONTEXT
+    # ==================================================================
+    _render_iv_context_section(iv_ctx, atm_iv)
 
     st.divider()
 
@@ -654,7 +1404,9 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
             if not ce_buildup.empty:
                 d = ce_buildup[["strike", "oi_change", "oi", "ltp", "change", "oi_action"]].copy()
                 d.columns = ["Strike", "OI Chg", "Total OI", "LTP", "Price Chg", "Action"]
-                st.dataframe(d.round(2), use_container_width=True, hide_index=True)
+                num_cols = d.select_dtypes(include="number").columns
+                d[num_cols] = d[num_cols].round(2)
+                st.dataframe(d, width="stretch", hide_index=True)
             else:
                 st.info("No fresh call OI buildup")
         with col2:
@@ -662,7 +1414,9 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
             if not pe_buildup.empty:
                 d = pe_buildup[["strike", "oi_change", "oi", "ltp", "change", "oi_action"]].copy()
                 d.columns = ["Strike", "OI Chg", "Total OI", "LTP", "Price Chg", "Action"]
-                st.dataframe(d.round(2), use_container_width=True, hide_index=True)
+                num_cols = d.select_dtypes(include="number").columns
+                d[num_cols] = d[num_cols].round(2)
+                st.dataframe(d, width="stretch", hide_index=True)
             else:
                 st.info("No fresh put OI buildup")
 
@@ -676,7 +1430,9 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
             if not ce_unwinding.empty:
                 d = ce_unwinding[["strike", "oi_change", "oi", "ltp", "change", "oi_action"]].copy()
                 d.columns = ["Strike", "OI Chg", "Total OI", "LTP", "Price Chg", "Action"]
-                st.dataframe(d.round(2), use_container_width=True, hide_index=True)
+                num_cols = d.select_dtypes(include="number").columns
+                d[num_cols] = d[num_cols].round(2)
+                st.dataframe(d, width="stretch", hide_index=True)
             else:
                 st.success("No call unwinding — resistance holding firm")
         with col2:
@@ -684,9 +1440,26 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
             if not pe_unwinding.empty:
                 d = pe_unwinding[["strike", "oi_change", "oi", "ltp", "change", "oi_action"]].copy()
                 d.columns = ["Strike", "OI Chg", "Total OI", "LTP", "Price Chg", "Action"]
-                st.dataframe(d.round(2), use_container_width=True, hide_index=True)
+                num_cols = d.select_dtypes(include="number").columns
+                d[num_cols] = d[num_cols].round(2)
+                st.dataframe(d, width="stretch", hide_index=True)
             else:
                 st.success("No put unwinding — support holding firm")
+
+    st.divider()
+
+    # ==================================================================
+    # 🏦 SMART MONEY TRACKING
+    # ==================================================================
+    _render_smart_money_section(df, spot)
+
+    st.divider()
+
+    # ==================================================================
+    # 🎯 ENTRY TRIGGERS
+    # ==================================================================
+    _render_entry_triggers_section(entry_signals, chain_df=df, spot=spot,
+                                    expiry_date=expiry_date)
 
     st.divider()
 
@@ -731,7 +1504,7 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
         new_idx = idx + direction
         if 0 <= new_idx < len(all_strikes):
             return all_strikes[new_idx]
-        return strike + (50 * direction)  # fallback NIFTY step
+        return strike + (_active_profile()["strike_step"] * direction)
 
     # ----- Determine strategy + pick strikes -----
     ce_heavy_unwinding = (calls["oi_change"] < 0).sum() > len(calls) * 0.5
@@ -901,7 +1674,9 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
             })
 
     # ----- Render each strategy -----
-    for strat in strategies:
+    from paper_trading import place_order as _pt_place
+
+    for strat_idx, strat in enumerate(strategies):
         # Strategy header
         st.markdown(
             f"<div style='padding:14px; border-left:5px solid {strat['color']}; "
@@ -935,7 +1710,10 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
                 legs_rows.append(row)
 
             legs_df = pd.DataFrame(legs_rows)
-            st.dataframe(legs_df.round(2), use_container_width=True, hide_index=True)
+            # Ensure numeric columns are numeric (avoid Arrow mixed-type error)
+            for col in legs_df.columns:
+                legs_df[col] = legs_df[col].astype(str)
+            st.dataframe(legs_df, width="stretch", hide_index=True)
 
             # P&L summary
             pnl_parts = []
@@ -954,6 +1732,36 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
 
             if pnl_parts:
                 st.markdown(" &nbsp;|&nbsp; ".join(pnl_parts))
+
+            # --- One-click paper trade execution ---
+            all_priced = all(leg.get("premium", 0) > 0 for leg in strat["legs"])
+            if all_priced:
+                if st.button(
+                    f"📝 Paper Trade: {strat['name']}",
+                    key=f"pt_suggestion_{strat_idx}",
+                    type="primary",
+                ):
+                    import uuid
+                    group_id = uuid.uuid4().hex[:12]
+                    placed = 0
+                    for leg in strat["legs"]:
+                        _pt_place(
+                            expiry_date=expiry_date,
+                            strike=leg["strike"],
+                            option_type=leg["type"],
+                            action=leg["action"],
+                            lots=1,
+                            entry_price=leg["premium"],
+                            strategy=strat["name"],
+                            group_id=group_id,
+                            notes=strat["reason"],
+                            lot_size=_active_profile()["lot_size"],
+                        )
+                        placed += 1
+                    st.success(
+                        f"Paper trade placed: {strat['name']} ({placed} legs) — "
+                        f"check Paper Trading tab"
+                    )
 
     # Signal breakdown
     with st.expander("Signal breakdown"):
@@ -1055,42 +1863,45 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict):
 
 def render_dashboard(fetcher: FyersDataFetcher):
     """Render the live dashboard tab content."""
-    # Auto-refresh (only active on this tab)
-    refresh_ms = config.REFRESH_INTERVAL_SEC * 1000
-    st_autorefresh(interval=refresh_ms, key="data_refresh")
-
     settings = render_sidebar(fetcher)
 
-    if settings["refresh_sec"] != config.REFRESH_INTERVAL_SEC:
-        st_autorefresh(
-            interval=settings["refresh_sec"] * 1000,
-            key="data_refresh_custom",
-        )
+    # Store refresh interval for main() to pick up on next cycle
+    st.session_state["_refresh_sec"] = settings["refresh_sec"]
 
-    # Fetch data
-    try:
-        spot = fetcher.get_spot_quote()
-        chain_df = fetcher.get_option_chain(
-            strike_count=settings["strike_count"],
-            expiry_ts=settings["selected_expiry_ts"],
-        )
-    except Exception as e:
-        st.error(f"Failed to fetch data: {e}")
-        st.info("Check your API credentials and network connection.")
+    # Fetch data via shared cache (avoids duplicate calls across tabs)
+    data = _fetch_shared_data(fetcher, settings["strike_count"],
+                              settings["selected_expiry_ts"])
+    if data is None:
+        st.error("Failed to fetch data. Check API credentials and network connection.")
         return
+
+    spot = data["spot"]
+    chain_df = data["chain_df"]
 
     if chain_df.empty:
         st.warning("No option chain data returned. Market may be closed.")
         return
 
+    # Debug: warn if strikes are missing
+    if (chain_df["strike"] == 0).all():
+        st.error("All strikes are 0 — Fyers API response format may have changed. Check data_fetcher.py.")
+        st.json({"sample_columns": list(chain_df.columns), "rows": len(chain_df)})
+        return
+
     # Compute time to expiry
     T = time_to_expiry(settings["selected_expiry_date"]) if settings["selected_expiry_date"] else 1 / 365.25
 
-    # Enrich with Greeks
+    # Enrich with Greeks (now vectorized — fast)
     chain_df = enrich_with_greeks(chain_df, spot["ltp"], config.RISK_FREE_RATE, T)
 
+    # Store enriched chain for paper trading tab to reuse
+    st.session_state["_enriched_chain"] = chain_df
+    st.session_state["_spot"] = spot
+    st.session_state["_expiry_data"] = data["expiry_list"]
+    st.session_state["_expiry_date"] = settings["selected_expiry_date"]
+
     # Render sections
-    render_spot_header(spot)
+    render_spot_header(spot, index_name=_active_profile()["name"])
     st.divider()
 
     render_option_chain_table(chain_df, spot["ltp"])
@@ -1106,25 +1917,52 @@ def render_dashboard(fetcher: FyersDataFetcher):
     st.divider()
 
     pcr_data = calculate_pcr(chain_df)
-    render_market_intelligence(chain_df, spot["ltp"], pcr_data)
+    spot_candles = _get_cached_spot_candles(fetcher)
+    render_market_intelligence(chain_df, spot["ltp"], pcr_data, spot_candles,
+                               expiry_date=settings["selected_expiry_date"])
 
 
 def main():
+    # Auto-refresh — MUST be before tabs.
+    # Disabled when backtest is running to prevent page reload killing the backtest.
+    # Uses user-configured interval from sidebar (persisted in session state).
+    if not st.session_state.get("backtest_running"):
+        refresh_sec = st.session_state.get("_refresh_sec", config.REFRESH_INTERVAL_SEC)
+        st_autorefresh(interval=refresh_sec * 1000, key="data_refresh")
+
+    # Index selector (top of sidebar, before everything else)
+    with st.sidebar:
+        index_options = list(config.INDEX_PROFILES.keys())
+        index_name = st.selectbox("📊 Index", index_options, key="index_selector")
+        profile = config.INDEX_PROFILES[index_name]
+        st.session_state["_index_profile"] = profile
+        st.divider()
+
     # Create tabs FIRST so they're always visible
-    tab_dashboard, tab_backtest = st.tabs(["📊 Live Dashboard", "📈 Backtest"])
+    tab_dashboard, tab_backtest, tab_paper = st.tabs(
+        ["📊 Live Dashboard", "📈 Backtest", "📝 Paper Trading"]
+    )
 
     # Auth (shared across both tabs)
     token = check_auth()
     if not token:
         return
 
-    fetcher = FyersDataFetcher(token)
+    fetcher = FyersDataFetcher(
+        token,
+        underlying=profile["underlying"],
+        options_symbol=profile["options_symbol"],
+    )
 
+    # Dashboard renders first and populates shared cache
     with tab_dashboard:
         render_dashboard(fetcher)
 
     with tab_backtest:
         render_backtest_tab(fetcher)
+
+    with tab_paper:
+        render_paper_trading_tab(fetcher)
 
 
 if __name__ == "__main__":

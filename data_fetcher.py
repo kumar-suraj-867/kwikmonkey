@@ -1,5 +1,6 @@
 """Fetch option chain and market data from Fyers API."""
 
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -8,27 +9,50 @@ from fyers_apiv3 import fyersModel
 import config
 
 
+def _extract_strike(item: dict) -> float:
+    """Extract strike price from an option chain item, trying multiple keys
+    and falling back to parsing the symbol name."""
+    # Try known API key names
+    strike = (item.get("strikePrice")
+              or item.get("strike_price")
+              or item.get("strikeprice")
+              or item.get("strike"))
+    if strike and float(strike) > 0:
+        return float(strike)
+
+    # Fallback: parse from symbol like NSE:NIFTY25D1023500CE
+    sym = item.get("symbol", "")
+    m = re.search(r'(\d{4,6})(CE|PE)$', sym)
+    if m:
+        return float(m.group(1))
+
+    return 0.0
+
+
 class FyersDataFetcher:
     """Wrapper around Fyers API for option chain and spot data."""
 
-    def __init__(self, access_token: str):
+    def __init__(self, access_token: str,
+                 underlying: str = None, options_symbol: str = None):
         self.fyers = fyersModel.FyersModel(
             client_id=config.FYERS_APP_ID,
             token=access_token,
             is_async=False,
             log_path="",
         )
+        self.underlying = underlying or config.NIFTY_UNDERLYING
+        self.options_symbol = options_symbol or self.options_symbol
 
     # ------------------------------------------------------------------
     # Spot / underlying
     # ------------------------------------------------------------------
 
     def get_spot_quote(self) -> dict:
-        """Return spot price info for NIFTY 50.
+        """Return spot price info for the active index.
 
         Returns dict with keys: ltp, change, change_pct, open, high, low, prev_close.
         """
-        resp = self.fyers.quotes({"symbols": config.NIFTY_UNDERLYING})
+        resp = self.fyers.quotes({"symbols": self.underlying})
 
         if resp.get("code") != 200 and resp.get("s") != "ok":
             raise RuntimeError(f"Quotes API error: {resp}")
@@ -57,7 +81,7 @@ class FyersDataFetcher:
         """
         # First call without timestamp to get the expiry list from error/data
         resp = self.fyers.optionchain(
-            {"symbol": config.NIFTY_OPTIONS_SYMBOL, "strikecount": 1, "timestamp": ""}
+            {"symbol": self.options_symbol, "strikecount": 1, "timestamp": ""}
         )
         # The API may return the expiry list even on error code 1
         expiry_data = resp.get("data", {}).get("expiryData", [])
@@ -82,7 +106,7 @@ class FyersDataFetcher:
             strike_count = config.DEFAULT_STRIKE_COUNT
 
         params = {
-            "symbol": config.NIFTY_OPTIONS_SYMBOL,
+            "symbol": self.options_symbol,
             "strikecount": strike_count,
             "timestamp": expiry_ts,
         }
@@ -99,7 +123,7 @@ class FyersDataFetcher:
         for item in chain:
             rows.append({
                 "symbol": item.get("symbol", ""),
-                "strike": item.get("strikePrice", 0),
+                "strike": _extract_strike(item),
                 "option_type": item.get("option_type", ""),
                 "ltp": item.get("ltp", 0),
                 "bid": item.get("bid", 0),
@@ -128,7 +152,7 @@ class FyersDataFetcher:
             strike_count = config.DEFAULT_STRIKE_COUNT
 
         params = {
-            "symbol": config.NIFTY_OPTIONS_SYMBOL,
+            "symbol": self.options_symbol,
             "strikecount": strike_count,
             "timestamp": expiry_ts,
         }
@@ -148,7 +172,7 @@ class FyersDataFetcher:
         for item in chain:
             rows.append({
                 "symbol": item.get("symbol", ""),
-                "strike": item.get("strikePrice", 0),
+                "strike": _extract_strike(item),
                 "option_type": item.get("option_type", ""),
                 "ltp": item.get("ltp", 0),
                 "bid": item.get("bid", 0),

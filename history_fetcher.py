@@ -9,34 +9,29 @@ import config
 
 
 class HistoryFetcher:
-    """Wraps fyers.history() with error handling and DataFrame output."""
+    """Wraps fyers.history() with error handling, rate-limiting, and retries."""
 
-    def __init__(self, fyers_model: fyersModel.FyersModel):
+    def __init__(self, fyers_model: fyersModel.FyersModel,
+                 underlying: str = None):
         self.fyers = fyers_model
-        self.last_error = None  # stores last API error for debugging
+        self.underlying = underlying or config.NIFTY_UNDERLYING
+        self.last_error = None
 
-    # Map user-friendly resolution names to Fyers API values
     _RESOLUTION_MAP = {
         "Day": "D", "day": "D", "1D": "D", "D": "D",
         "1": "1", "5": "5", "15": "15", "30": "30",
         "60": "60", "120": "120", "240": "240",
     }
 
+    _MAX_RETRIES = 3
+    _BASE_DELAY = 1.0  # seconds between calls
+    _RETRY_DELAY = 3.0  # seconds to wait on rate limit before retry
+
     def get_candles(self, symbol: str, from_date: str, to_date: str,
                     resolution: str = "15") -> pd.DataFrame:
         """Fetch OHLCV candles for any symbol.
 
-        Parameters
-        ----------
-        symbol : Fyers symbol e.g. "NSE:NIFTY50-INDEX" or "NSE:NIFTY2541024000CE"
-        from_date : "yyyy-mm-dd"
-        to_date : "yyyy-mm-dd"
-        resolution : "1","5","15","30","60","D","Day"
-
-        Returns
-        -------
-        DataFrame with columns: timestamp, open, high, low, close, volume
-        Empty DataFrame on error or no data.
+        Includes rate-limit delay and automatic retry on 'request limit reached'.
         """
         fyers_res = self._RESOLUTION_MAP.get(resolution, resolution)
 
@@ -46,37 +41,54 @@ class HistoryFetcher:
             "date_format": "1",
             "range_from": from_date,
             "range_to": to_date,
-            "cont_flag": "0",
+            "cont_flag": "1",
         }
 
         self.last_error = None
 
-        try:
-            resp = self.fyers.history(data=params)
-        except Exception as e:
-            self.last_error = f"Exception for {symbol}: {e}"
+        for attempt in range(self._MAX_RETRIES):
+            # Rate-limit: wait between every API call
+            time.sleep(self._BASE_DELAY)
+
+            try:
+                resp = self.fyers.history(data=params)
+            except Exception as e:
+                self.last_error = f"Exception for {symbol}: {e}"
+                return pd.DataFrame()
+
+            if resp.get("s") == "ok":
+                candles = resp.get("candles", [])
+                if not candles:
+                    self.last_error = f"{symbol}: API returned ok but 0 candles"
+                    return pd.DataFrame()
+
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+                return df
+
+            # Check if rate limited
+            msg = str(resp.get("message", ""))
+            if "request limit" in msg.lower() or "rate limit" in msg.lower():
+                wait = self._RETRY_DELAY * (attempt + 1)
+                time.sleep(wait)
+                continue  # retry
+
+            # Other error — don't retry
+            self.last_error = f"{symbol} [{from_date} → {to_date}]: {resp.get('s')} — {msg}"
             return pd.DataFrame()
 
-        if resp.get("s") != "ok":
-            self.last_error = f"{symbol} [{from_date} → {to_date}]: {resp.get('s')} — {resp.get('message', resp)}"
-            return pd.DataFrame()
-
-        candles = resp.get("candles", [])
-        if not candles:
-            self.last_error = f"{symbol}: API returned ok but 0 candles"
-            return pd.DataFrame()
-
-        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        return df
+        # All retries exhausted
+        self.last_error = f"{symbol} [{from_date} → {to_date}]: rate limit — retries exhausted"
+        return pd.DataFrame()
 
     def get_spot_candles(self, from_date: str, to_date: str,
-                         resolution: str = "15") -> pd.DataFrame:
-        """Fetch NIFTY 50 index candles."""
-        return self.get_candles(config.NIFTY_UNDERLYING, from_date, to_date, resolution)
+                         resolution: str = "15",
+                         underlying: str = None) -> pd.DataFrame:
+        """Fetch index spot candles."""
+        symbol = underlying or self.underlying
+        return self.get_candles(symbol, from_date, to_date, resolution)
 
     def get_option_candles(self, symbol: str, from_date: str, to_date: str,
                            resolution: str = "15") -> pd.DataFrame:
-        """Fetch candles for an individual option contract with rate-limit delay."""
-        time.sleep(config.HISTORY_API_DELAY_SEC)
+        """Fetch candles for an individual option contract."""
         return self.get_candles(symbol, from_date, to_date, resolution)

@@ -17,11 +17,18 @@ from data_collector import DataCollector
 from history_fetcher import HistoryFetcher
 
 
+def _active_profile() -> dict:
+    """Get active index profile from session state."""
+    return st.session_state.get(
+        "_index_profile", config.INDEX_PROFILES["NIFTY 50"]
+    )
+
+
 def render_backtest_tab(fetcher: FyersDataFetcher):
     """Main entry point for the Backtest tab."""
     st.header("📈 Strategy Backtester")
 
-    history = HistoryFetcher(fetcher.fyers)
+    history = HistoryFetcher(fetcher.fyers, underlying=fetcher.underlying)
 
     # ------------------------------------------------------------------
     # Data collection controls
@@ -36,18 +43,29 @@ def render_backtest_tab(fetcher: FyersDataFetcher):
     with st.container(border=True):
         st.subheader("Backtest Configuration")
 
-        col1, col2, col3 = st.columns(3)
+        STRATEGIES = [
+            "Long Call", "Long Put",
+            "Long Straddle", "Long Strangle",
+            "Bull Call Spread", "Bear Put Spread",
+            "Bull Put Spread", "Bear Call Spread",
+            "Iron Condor",
+        ]
+
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
         with col1:
-            strategy = st.selectbox(
-                "Strategy",
-                ["Iron Condor", "Bull Call Spread", "Bear Put Spread", "Long Straddle"],
-            )
+            strategy = st.selectbox("Strategy", STRATEGIES)
         with col2:
-            start_date = st.date_input(
-                "Start date",
-                value=date.today() - timedelta(days=90),
+            holding_mode = st.selectbox(
+                "Holding",
+                ["Intraday", "BTST", "Overnight", "Expiry"],
+                help="Intraday = open→close same day | BTST = open→next close | Overnight = close→next open | Expiry = hold till expiry",
             )
         with col3:
+            start_date = st.date_input(
+                "Start date",
+                value=date.today() - timedelta(days=30),
+            )
+        with col4:
             end_date = st.date_input(
                 "End date",
                 value=date.today() - timedelta(days=1),
@@ -55,30 +73,55 @@ def render_backtest_tab(fetcher: FyersDataFetcher):
 
         # Strategy-specific parameters
         st.markdown("**Strike parameters**")
-        if strategy == "Iron Condor":
+        ce_offset = 0
+        pe_offset = 0
+        wing_width = 0
+
+        if strategy == "Long Call":
+            ce_offset = st.number_input(
+                "CE strike offset from ATM (pts)", value=0, step=50, min_value=-500, max_value=500,
+                key="lc_ce_offset", help="0 = ATM, +ve = OTM, -ve = ITM")
+            st.caption(f"{'ATM' if ce_offset == 0 else 'OTM +' + str(ce_offset) if ce_offset > 0 else 'ITM ' + str(ce_offset)} strike")
+        elif strategy == "Long Put":
+            pe_offset = st.number_input(
+                "PE strike offset from ATM (pts)", value=0, step=50, min_value=-500, max_value=500,
+                key="lp_pe_offset", help="0 = ATM, +ve = OTM, -ve = ITM")
+            st.caption(f"{'ATM' if pe_offset == 0 else 'OTM +' + str(pe_offset) if pe_offset > 0 else 'ITM ' + str(pe_offset)} strike")
+        elif strategy == "Long Straddle":
+            st.caption("Both legs at ATM")
+        elif strategy == "Long Strangle":
+            c1, c2 = st.columns(2)
+            ce_offset = c1.number_input("CE offset from ATM (pts)", value=100, step=50, min_value=50, key="ls_ce")
+            pe_offset = c2.number_input("PE offset from ATM (pts)", value=100, step=50, min_value=50, key="ls_pe")
+        elif strategy in ("Bull Call Spread", "Bear Call Spread"):
+            ce_offset = st.number_input("CE spread width (pts)", value=200, step=50, min_value=50, key="bcs_ce")
+        elif strategy in ("Bear Put Spread", "Bull Put Spread"):
+            pe_offset = st.number_input("PE spread width (pts)", value=200, step=50, min_value=50, key="bps_pe")
+        elif strategy == "Iron Condor":
             c1, c2, c3 = st.columns(3)
-            ce_offset = c1.number_input("CE offset from ATM (pts)", value=200, step=50, min_value=50)
-            pe_offset = c2.number_input("PE offset from ATM (pts)", value=200, step=50, min_value=50)
-            wing_width = c3.number_input("Wing width (pts)", value=50, step=50, min_value=50)
-        elif strategy == "Bull Call Spread":
-            ce_offset = st.number_input("Sell CE offset from ATM (pts)", value=200, step=50, min_value=50)
-            pe_offset = 0
-            wing_width = 0
-        elif strategy == "Bear Put Spread":
-            pe_offset = st.number_input("Sell PE offset from ATM (pts)", value=200, step=50, min_value=50)
-            ce_offset = 0
-            wing_width = 0
-        else:  # Long Straddle
-            ce_offset = 0
-            pe_offset = 0
-            wing_width = 0
+            ce_offset = c1.number_input("CE offset from ATM (pts)", value=200, step=50, min_value=50, key="ic_ce")
+            pe_offset = c2.number_input("PE offset from ATM (pts)", value=200, step=50, min_value=50, key="ic_pe")
+            wing_width = c3.number_input("Wing width (pts)", value=50, step=50, min_value=50, key="ic_wing")
 
         st.markdown("**Risk management & model**")
-        c1, c2, c3, c4 = st.columns(4)
-        stop_loss_pct = c1.number_input("Stop-loss %", value=50.0, step=5.0, min_value=10.0, max_value=100.0)
-        target_pct = c2.number_input("Target %", value=50.0, step=5.0, min_value=10.0, max_value=200.0)
-        lot_size = c3.number_input("Lot size", value=config.NIFTY_LOT_SIZE, step=25, min_value=25)
-        days_before = c4.number_input("Entry days before expiry", value=4, step=1, min_value=1, max_value=7)
+        if holding_mode == "Expiry":
+            c1, c2, c3, c4 = st.columns(4)
+            stop_loss_pct = c1.number_input("Stop-loss %", value=50.0, step=5.0, min_value=10.0, max_value=100.0)
+            target_pct = c2.number_input("Target %", value=50.0, step=5.0, min_value=10.0, max_value=200.0)
+            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            days_before = c4.number_input("Entry days before expiry", value=4, step=1, min_value=1, max_value=7)
+        elif holding_mode == "Overnight":
+            lot_size = st.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            stop_loss_pct = 100  # no intraday SL for overnight
+            target_pct = 100
+            days_before = 4
+            st.caption("Overnight: no SL/target — buy at close, sell at next open")
+        else:
+            c1, c2, c3 = st.columns(3)
+            stop_loss_pct = c1.number_input("Stop-loss %", value=50.0, step=5.0, min_value=10.0, max_value=100.0)
+            target_pct = c2.number_input("Target %", value=50.0, step=5.0, min_value=10.0, max_value=200.0)
+            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            days_before = 4  # not used in daily modes
 
         st.markdown("**Execution & pricing**")
         c1, c2, c3, c4 = st.columns(4)
@@ -93,53 +136,76 @@ def render_backtest_tab(fetcher: FyersDataFetcher):
     # ------------------------------------------------------------------
     # Run button
     # ------------------------------------------------------------------
-    run_btn = st.button("🚀 Run Backtest", type="primary", use_container_width=True)
+    # Button callback sets flag BEFORE the rerun, so autorefresh is skipped
+    def _start_backtest():
+        st.session_state["backtest_running"] = True
 
-    if not run_btn:
-        st.info(
-            "Uses **local DB data** when available, falls back to **Black-Scholes model** "
-            "from NIFTY spot candles. Start collecting data above to build your dataset."
-        )
-        if "backtest_result" in st.session_state:
-            # Clear stale results from old engine version
-            old = st.session_state["backtest_result"]
-            if old.trades and not hasattr(old.trades[0], "data_source"):
-                del st.session_state["backtest_result"]
-            else:
-                _render_results(old)
+    st.button("🚀 Run Backtest", type="primary", width="stretch",
+              on_click=_start_backtest)
+
+    # If flag is set, run the backtest now (autorefresh already skipped)
+    if st.session_state.get("backtest_running"):
+        progress_bar = st.progress(0, text="Starting backtest...")
+
+        def on_progress(current, total, message):
+            pct = current / total if total > 0 else 0
+            progress_bar.progress(pct, text=f"{message} ({current}/{total})")
+
+        try:
+            result = run_backtest(
+                history_fetcher=history,
+                strategy_name=strategy,
+                start_date=start_date,
+                end_date=end_date,
+                ce_offset=ce_offset,
+                pe_offset=pe_offset,
+                wing_width=wing_width,
+                lot_size=lot_size,
+                stop_loss_pct=stop_loss_pct,
+                target_pct=target_pct,
+                days_before_expiry=days_before,
+                resolution=resolution,
+                iv=iv_pct / 100,
+                slippage_pts=slippage,
+                brokerage_per_lot=brokerage,
+                holding_mode=holding_mode,
+                expiry_weekday=_active_profile().get("expiry_weekday", 3),
+                progress_callback=on_progress,
+            )
+            st.session_state["backtest_result"] = result
+        except Exception as e:
+            import traceback
+            st.session_state["backtest_error"] = traceback.format_exc()
+        finally:
+            st.session_state["backtest_running"] = False
+
+        progress_bar.empty()
+        st.rerun()
         return
 
-    # ------------------------------------------------------------------
-    # Execute backtest
-    # ------------------------------------------------------------------
-    progress_bar = st.progress(0, text="Starting backtest...")
+    # Show error if last run failed
+    if "backtest_error" in st.session_state:
+        st.error("Backtest failed:")
+        st.code(st.session_state.pop("backtest_error"), language="text")
+        return
 
-    def on_progress(current, total, message):
-        pct = current / total if total > 0 else 0
-        progress_bar.progress(pct, text=f"{message} ({current}/{total})")
-
-    result = run_backtest(
-        history_fetcher=history,
-        strategy_name=strategy,
-        start_date=start_date,
-        end_date=end_date,
-        ce_offset=ce_offset,
-        pe_offset=pe_offset,
-        wing_width=wing_width,
-        lot_size=lot_size,
-        stop_loss_pct=stop_loss_pct,
-        target_pct=target_pct,
-        days_before_expiry=days_before,
-        resolution=resolution,
-        iv=iv_pct / 100,
-        slippage_pts=slippage,
-        brokerage_per_lot=brokerage,
-        progress_callback=on_progress,
-    )
-
-    progress_bar.empty()
-    st.session_state["backtest_result"] = result
-    _render_results(result)
+    # Show results from session state
+    if "backtest_result" in st.session_state:
+        result = st.session_state["backtest_result"]
+        if result.trades and not hasattr(result.trades[0], "data_source"):
+            del st.session_state["backtest_result"]
+        else:
+            try:
+                _render_results(result)
+            except Exception as e:
+                import traceback
+                st.error(f"Error rendering results: {e}")
+                st.code(traceback.format_exc(), language="text")
+    else:
+        st.info(
+            "Uses **local DB data** when available, falls back to **Black-Scholes model** "
+            f"from {_active_profile()['name']} spot candles. Start collecting data above to build your dataset."
+        )
 
 
 # ======================================================================
@@ -294,7 +360,7 @@ def _render_results(result: BacktestResult):
                 height=400,
                 margin=dict(t=20, b=40),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with col_right:
         st.markdown("**P&L Distribution**")
@@ -316,7 +382,7 @@ def _render_results(result: BacktestResult):
                 height=400,
                 margin=dict(t=20, b=40),
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
     st.divider()
 
@@ -354,7 +420,11 @@ def _render_results(result: BacktestResult):
         })
 
     trade_df = pd.DataFrame(rows)
-    st.dataframe(trade_df, use_container_width=True, hide_index=True)
+    # Convert dates to strings for clean Arrow serialization
+    for col in ["Expiry", "Entry"]:
+        if col in trade_df.columns:
+            trade_df[col] = trade_df[col].astype(str)
+    st.dataframe(trade_df, width="stretch", hide_index=True)
 
     # ------------------------------------------------------------------
     # Warnings & params
@@ -365,6 +435,6 @@ def _render_results(result: BacktestResult):
                 st.caption(w)
 
     with st.expander("Backtest parameters"):
-        params_df = pd.DataFrame([result.params]).T
+        params_df = pd.DataFrame([{k: str(v) for k, v in result.params.items()}]).T
         params_df.columns = ["Value"]
-        st.dataframe(params_df, use_container_width=True)
+        st.dataframe(params_df, width="stretch")

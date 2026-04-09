@@ -117,37 +117,75 @@ def calculate_greeks(S: float, K: float, T: float, r: float, sigma: float,
 
 def enrich_with_greeks(df: pd.DataFrame, spot: float, r: float,
                        T: float) -> pd.DataFrame:
-    """Add Greeks columns to the option chain DataFrame.
+    """Add Greeks columns to the option chain DataFrame (vectorized).
 
     Expects columns: strike, option_type, ltp (and optionally iv).
     """
-    greeks_data = []
+    if df.empty or T <= 0:
+        for col in ("delta", "gamma", "theta", "vega"):
+            df[col] = 0.0
+        if "iv" not in df.columns:
+            df["iv"] = 0.0
+        return df
 
-    for _, row in df.iterrows():
-        strike = row["strike"]
-        opt_type = row["option_type"]
-        ltp = row.get("ltp", 0)
+    df = df.copy()
+    K = df["strike"].values.astype(float)
+    is_ce = (df["option_type"] == "CE").values
 
-        # Compute IV if not provided
-        iv = row.get("iv")
-        if iv is None or iv <= 0 or pd.isna(iv):
-            iv = implied_volatility(ltp, spot, strike, T, r, opt_type)
-        else:
-            iv = iv / 100  # convert from percentage
+    # --- IV: use API-provided when available, else Newton-Raphson ---
+    iv_raw = df["iv"].values.astype(float) if "iv" in df.columns else np.zeros(len(df))
+    sigma = np.where((iv_raw > 0) & ~np.isnan(iv_raw), iv_raw / 100, 0.0)
 
-        if iv and iv > 0:
-            g = calculate_greeks(spot, strike, T, r, iv, opt_type)
-            g["iv"] = round(iv * 100, 2)
-        else:
-            g = {"delta": 0, "gamma": 0, "theta": 0, "vega": 0, "iv": 0}
+    # Compute IV only for rows missing it (much fewer Newton-Raphson calls)
+    needs_iv = sigma <= 0
+    if needs_iv.any():
+        ltp_arr = df["ltp"].values.astype(float)
+        for idx in np.where(needs_iv)[0]:
+            opt_type = "CE" if is_ce[idx] else "PE"
+            computed = implied_volatility(ltp_arr[idx], spot, K[idx], T, r, opt_type)
+            if computed and computed > 0:
+                sigma[idx] = computed
 
-        greeks_data.append(g)
+    # --- Vectorized Greeks ---
+    valid = (sigma > 0) & (K > 0)
+    S = float(spot)
+    sqrt_T = np.sqrt(T)
 
-    greeks_df = pd.DataFrame(greeks_data)
-    # Drop columns from df that greeks_df will replace to avoid duplicates
-    overlap = [c for c in greeks_df.columns if c in df.columns]
-    df_clean = df.drop(columns=overlap).reset_index(drop=True)
-    return pd.concat([df_clean, greeks_df], axis=1)
+    d1 = np.zeros(len(df))
+    d2 = np.zeros(len(df))
+    d1[valid] = (np.log(S / K[valid]) + (r + 0.5 * sigma[valid]**2) * T) / (sigma[valid] * sqrt_T)
+    d2[valid] = d1[valid] - sigma[valid] * sqrt_T
+
+    nd1 = norm.cdf(d1)
+    npdf_d1 = norm.pdf(d1)
+    nd2 = norm.cdf(d2)
+
+    # Delta
+    delta = np.where(is_ce, nd1, nd1 - 1)
+    delta[~valid] = 0
+
+    # Gamma
+    gamma = np.zeros(len(df))
+    gamma[valid] = npdf_d1[valid] / (S * sigma[valid] * sqrt_T)
+
+    # Theta (per calendar day)
+    theta = np.zeros(len(df))
+    common = -(S * npdf_d1 * sigma) / (2 * sqrt_T)
+    theta_ce = common - r * K * np.exp(-r * T) * nd2
+    theta_pe = common + r * K * np.exp(-r * T) * norm.cdf(-d2)
+    theta = np.where(is_ce, theta_ce, theta_pe) / 365
+    theta[~valid] = 0
+
+    # Vega (per 1% vol move)
+    vega = np.zeros(len(df))
+    vega[valid] = S * npdf_d1[valid] * sqrt_T / 100
+
+    df["delta"] = np.round(delta, 4)
+    df["gamma"] = np.round(gamma, 6)
+    df["theta"] = np.round(theta, 2)
+    df["vega"] = np.round(vega, 2)
+    df["iv"] = np.round(sigma * 100, 2)
+    return df
 
 
 # ---------------------------------------------------------------------------
