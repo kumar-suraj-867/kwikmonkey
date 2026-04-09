@@ -1,5 +1,6 @@
 """Options Trading Dashboard — real-time metrics via Fyers API."""
 
+import os
 import sys
 from datetime import datetime, timedelta
 
