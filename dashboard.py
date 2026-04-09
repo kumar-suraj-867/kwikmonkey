@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+from datetime import time as dt_time
 
 import config
 from auth import get_valid_token, run_auth_flow, load_token, validate_token, save_token, generate_auth_url, generate_token
@@ -49,11 +49,7 @@ st.markdown("""
         border-radius: 8px;
         padding: 10px 14px;
     }
-    /* Hide st_autorefresh visible component */
-    iframe[title="streamlit_autorefresh.st_autorefresh"] {
-        display: none !important;
-        height: 0 !important;
-    }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1958,24 +1954,17 @@ def render_dashboard(fetcher: FyersDataFetcher):
 
 
 def main():
-    # Auto-refresh — MUST be before tabs.
-    # Disabled when backtest is running to prevent page reload killing the backtest.
-    # Uses user-configured interval from sidebar (persisted in session state).
-    if not st.session_state.get("backtest_running"):
-        refresh_sec = st.session_state.get("_refresh_sec", config.REFRESH_INTERVAL_SEC)
-        st_autorefresh(interval=refresh_sec * 1000, key="data_refresh")
-
     # Index selector (top of sidebar, before everything else)
     with st.sidebar:
         index_options = list(config.INDEX_PROFILES.keys())
-        index_name = st.selectbox("📊 Index", index_options, key="index_selector")
+        index_name = st.selectbox("Index", index_options, key="index_selector")
         profile = config.INDEX_PROFILES[index_name]
         st.session_state["_index_profile"] = profile
         st.divider()
 
     # Create tabs FIRST so they're always visible
     tab_dashboard, tab_backtest, tab_paper = st.tabs(
-        ["📊 Live Dashboard", "📈 Backtest", "📝 Paper Trading"]
+        ["Live Dashboard", "Backtest", "Paper Trading"]
     )
 
     # Auth (shared across both tabs)
@@ -1989,9 +1978,15 @@ def main():
         options_symbol=profile["options_symbol"],
     )
 
-    # Dashboard renders first and populates shared cache
+    # Dashboard uses st.fragment for auto-refresh without freezing the whole page
     with tab_dashboard:
-        render_dashboard(fetcher)
+        refresh_sec = st.session_state.get("_refresh_sec", config.REFRESH_INTERVAL_SEC)
+
+        @st.fragment(run_every=timedelta(seconds=refresh_sec))
+        def _live_dashboard():
+            render_dashboard(fetcher)
+
+        _live_dashboard()
 
     with tab_backtest:
         render_backtest_tab(fetcher)

@@ -2,4 +2,7 @@
 headless = true
 
 [logger]
-level = "debug"
+level = "warning"
+
+[theme]
+base = "dark"
