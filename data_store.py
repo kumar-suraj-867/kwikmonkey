@@ -368,14 +368,21 @@ def get_option_history(strike: float, option_type: str,
                        expiry_date_str: str = None,
                        db_path: str = DB_PATH) -> pd.DataFrame:
     """Fetch recorded option snapshots for a specific strike/type."""
+    # Use ROUND to handle REAL (float4) precision in PostgreSQL
     query = """
+        SELECT ts, strike, option_type, ltp, bid, ask,
+               oi, prev_oi, volume, iv, spot_price
+        FROM option_snapshots
+        WHERE ROUND(strike::numeric, 0) = ? AND option_type = ?
+          AND ts BETWEEN ? AND ?
+    """ if USE_POSTGRES else """
         SELECT ts, strike, option_type, ltp, bid, ask,
                oi, prev_oi, volume, iv, spot_price
         FROM option_snapshots
         WHERE strike = ? AND option_type = ?
           AND ts BETWEEN ? AND ?
     """
-    params = [strike, option_type, from_dt, to_dt]
+    params = [float(round(strike)), option_type, from_dt, to_dt]
 
     if expiry_date_str:
         query += " AND expiry_date = ?"
