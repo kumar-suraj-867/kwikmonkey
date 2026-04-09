@@ -2272,8 +2272,16 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     max_pain = calculate_max_pain(chain_df)
     trend = detect_trend(spot_candles) if not spot_candles.empty else {}
     structure = detect_structure(spot_candles) if not spot_candles.empty else {}
+    strike_step = profile.get("strike_step", 50)
+    atm_strike = round(spot["ltp"] / strike_step) * strike_step
+    atm_calls = chain_df[(chain_df["strike"] == atm_strike) & (chain_df["option_type"] == "CE")]
+    atm_puts = chain_df[(chain_df["strike"] == atm_strike) & (chain_df["option_type"] == "PE")]
+    atm_ce_iv = atm_calls["iv"].iloc[0] if not atm_calls.empty and "iv" in atm_calls.columns else 0
+    atm_pe_iv = atm_puts["iv"].iloc[0] if not atm_puts.empty and "iv" in atm_puts.columns else 0
+    atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 0
+
     iv_ctx = compute_iv_context(
-        chain_df, spot["ltp"], _get_historical_atm_iv(spot["ltp"])
+        atm_iv, _get_historical_atm_iv(spot["ltp"])
     )
     futures_basis = None
     if futures_data:
