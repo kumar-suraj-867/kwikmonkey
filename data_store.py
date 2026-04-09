@@ -5,9 +5,11 @@ Backend is auto-detected from DATABASE_URL env var or Streamlit secret.
 """
 
 import os
+import socket
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 
@@ -26,7 +28,27 @@ def _get_secret(key, default=""):
     return os.getenv(key, default)
 
 
-_DATABASE_URL = _get_secret("DATABASE_URL")
+def _resolve_ipv4(url: str) -> str:
+    """Replace hostname in a PostgreSQL URL with its IPv4 address.
+
+    Supabase returns IPv6 addresses which some hosts (Streamlit Cloud)
+    cannot connect to.  Resolving to IPv4 avoids the issue.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return url
+        ipv4 = socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
+        # Replace hostname (preserving user:pass and port) with the IPv4 address
+        netloc = parsed.netloc.replace(hostname, ipv4)
+        return urlunparse(parsed._replace(netloc=netloc))
+    except (socket.gaierror, IndexError, Exception):
+        return url
+
+
+_DATABASE_URL_RAW = _get_secret("DATABASE_URL")
+_DATABASE_URL = _resolve_ipv4(_DATABASE_URL_RAW) if _DATABASE_URL_RAW else ""
 USE_POSTGRES = bool(_DATABASE_URL and "postgres" in _DATABASE_URL)
 
 if USE_POSTGRES:
