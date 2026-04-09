@@ -70,6 +70,8 @@ def init_paper_tables(db_path: str = DB_PATH):
             conn.execute(
                 "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS lot_size INTEGER NOT NULL DEFAULT 65"
             )
+            conn.execute("ALTER TABLE paper_trades ENABLE ROW LEVEL SECURITY")
+            conn.execute("ALTER TABLE paper_account ENABLE ROW LEVEL SECURITY")
         else:
             try:
                 conn.execute("SELECT lot_size FROM paper_trades LIMIT 1")

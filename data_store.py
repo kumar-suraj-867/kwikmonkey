@@ -274,6 +274,11 @@ _DDL_POSTGRES = """
         ON spot_snapshots(ts);
 """
 
+_RLS_POSTGRES = """
+    ALTER TABLE option_snapshots ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE spot_snapshots ENABLE ROW LEVEL SECURITY;
+"""
+
 
 _db_initialized = False
 
@@ -285,6 +290,7 @@ def init_db(db_path: str = DB_PATH):
     with _connect(db_path) as conn:
         if USE_POSTGRES:
             conn.executescript(_DDL_POSTGRES)
+            conn.executescript(_RLS_POSTGRES)
         else:
             conn.executescript(_DDL_SQLITE)
     _db_initialized = True
