@@ -1889,8 +1889,12 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict,
 # ======================================================================
 
 def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
-    """Render the live dashboard tab content."""
-    # Fetch data via shared cache (avoids duplicate calls across tabs)
+    """Render the live dashboard tab content.
+
+    Heavy sections (charts, tables) render once.  A lightweight
+    st.fragment auto-refreshes only the spot header every N seconds.
+    """
+    # Fetch full data once per page load
     data = _fetch_shared_data(fetcher, settings["strike_count"],
                               settings["selected_expiry_ts"])
     if data is None:
@@ -1904,28 +1908,36 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
         st.warning("No option chain data returned. Market may be closed.")
         return
 
-    # Debug: warn if strikes are missing
     if (chain_df["strike"] == 0).all():
-        st.error("All strikes are 0 — Fyers API response format may have changed. Check data_fetcher.py.")
-        st.json({"sample_columns": list(chain_df.columns), "rows": len(chain_df)})
+        st.error("All strikes are 0 — Fyers API response format may have changed.")
         return
 
-    # Compute time to expiry
     T = time_to_expiry(settings["selected_expiry_date"]) if settings["selected_expiry_date"] else 1 / 365.25
-
-    # Enrich with Greeks (now vectorized — fast)
     chain_df = enrich_with_greeks(chain_df, spot["ltp"], config.RISK_FREE_RATE, T)
 
-    # Store enriched chain for paper trading tab to reuse
+    # Store for paper trading tab
     st.session_state["_enriched_chain"] = chain_df
     st.session_state["_spot"] = spot
     st.session_state["_expiry_data"] = data["expiry_list"]
     st.session_state["_expiry_date"] = settings["selected_expiry_date"]
 
-    # Render sections
-    render_spot_header(spot, index_name=_active_profile()["name"])
+    # --- Live spot header (auto-refreshes without touching the rest) ---
+    refresh_sec = settings["refresh_sec"]
+
+    @st.fragment(run_every=timedelta(seconds=refresh_sec))
+    def _live_spot():
+        try:
+            live_spot = fetcher.get_spot_quote()
+            st.session_state["_spot"] = live_spot
+        except Exception:
+            live_spot = spot  # fallback to last known
+        render_spot_header(live_spot, index_name=_active_profile()["name"])
+        st.caption(f"Auto-updates every {refresh_sec}s  |  Last: {datetime.now().strftime('%H:%M:%S')}")
+
+    _live_spot()
     st.divider()
 
+    # --- Heavy sections: rendered once per full page load ---
     render_option_chain_table(chain_df, spot["ltp"])
     st.divider()
 
@@ -1972,15 +1984,7 @@ def main():
     settings = render_sidebar(fetcher)
 
     with tab_dashboard:
-        refresh_sec = settings["refresh_sec"]
-
-        @st.fragment(run_every=timedelta(seconds=refresh_sec))
-        def _live_fragment():
-            # Clear stale cache so fragment fetches fresh data
-            st.session_state.pop("_shared_data", None)
-            render_dashboard(fetcher, settings)
-
-        _live_fragment()
+        render_dashboard(fetcher, settings)
 
     with tab_backtest:
         render_backtest_tab(fetcher)
