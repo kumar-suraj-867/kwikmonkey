@@ -2039,82 +2039,75 @@ def _render_migration_tab():
             "SELECT ts, expiry_date, strike, option_type, ltp, bid, ask, "
             "oi, prev_oi, volume, iv, spot_price FROM option_snapshots"
         ).fetchall()
-        if rows:
-            BATCH = 500
-            with _connect() as conn:
-                for i in range(0, len(rows), BATCH):
-                    batch = rows[i:i + BATCH]
-                    conn.executemany(
-                        "INSERT INTO option_snapshots "
-                        "(ts, expiry_date, strike, option_type, ltp, bid, ask, "
-                        "oi, prev_oi, volume, iv, spot_price) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT (ts, strike, option_type, expiry_date) DO NOTHING",
-                        batch,
-                    )
-                    pct = 10 + int(60 * min(i + BATCH, len(rows)) / len(rows))
-                    progress.progress(pct, text=f"option_snapshots: {min(i+BATCH, len(rows))}/{len(rows)}")
-        st.write(f"option_snapshots: {len(rows)} rows processed")
+        # Single connection for entire migration (avoid pool overhead)
+        with _connect() as conn:
+            # --- option_snapshots (bulk) ---
+            if rows:
+                progress.progress(10, text=f"Inserting {len(rows)} option_snapshots...")
+                conn.executemany(
+                    "INSERT INTO option_snapshots "
+                    "(ts, expiry_date, strike, option_type, ltp, bid, ask, "
+                    "oi, prev_oi, volume, iv, spot_price) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (ts, strike, option_type, expiry_date) DO NOTHING",
+                    rows,
+                )
+            st.write(f"option_snapshots: {len(rows)} rows")
 
-        # --- spot_snapshots ---
-        progress.progress(72, text="Migrating spot_snapshots...")
-        rows = lite.execute(
-            'SELECT ts, ltp, "open", high, low, prev_close FROM spot_snapshots'
-        ).fetchall()
-        if rows:
-            with _connect() as conn:
+            # --- spot_snapshots ---
+            progress.progress(70, text="Migrating spot_snapshots...")
+            rows = lite.execute(
+                'SELECT ts, ltp, "open", high, low, prev_close FROM spot_snapshots'
+            ).fetchall()
+            if rows:
                 conn.executemany(
                     'INSERT INTO spot_snapshots (ts, ltp, "open", high, low, prev_close) '
                     "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (ts) DO NOTHING",
                     rows,
                 )
-        st.write(f"spot_snapshots: {len(rows)} rows processed")
+            st.write(f"spot_snapshots: {len(rows)} rows")
 
-        # --- paper_trades ---
-        progress.progress(82, text="Migrating paper_trades...")
-        lite_cols = [c[1] for c in lite.execute("PRAGMA table_info(paper_trades)").fetchall()]
-        has_lot_size = "lot_size" in lite_cols
-        if has_lot_size:
-            select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
-                      "option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
-                      "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
-            insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
-                      "strike, option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
-                      "exit_reason, sl_price, target_price, status, pnl, notes) "
-                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
-        else:
-            select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
-                      "option_type, action, lots, entry_price, exit_time, exit_price, "
-                      "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
-            insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
-                      "strike, option_type, action, lots, entry_price, exit_time, exit_price, "
-                      "exit_reason, sl_price, target_price, status, pnl, notes) "
-                      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
-        rows = lite.execute(select).fetchall()
-        if rows:
-            with _connect() as conn:
+            # --- paper_trades ---
+            progress.progress(80, text="Migrating paper_trades...")
+            lite_cols = [c[1] for c in lite.execute("PRAGMA table_info(paper_trades)").fetchall()]
+            has_lot_size = "lot_size" in lite_cols
+            if has_lot_size:
+                select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
+                          "option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
+                          "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
+                insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
+                          "strike, option_type, action, lots, lot_size, entry_price, exit_time, exit_price, "
+                          "exit_reason, sl_price, target_price, status, pnl, notes) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
+            else:
+                select = ("SELECT id, group_id, strategy, entry_time, expiry_date, strike, "
+                          "option_type, action, lots, entry_price, exit_time, exit_price, "
+                          "exit_reason, sl_price, target_price, status, pnl, notes FROM paper_trades")
+                insert = ("INSERT INTO paper_trades (id, group_id, strategy, entry_time, expiry_date, "
+                          "strike, option_type, action, lots, entry_price, exit_time, exit_price, "
+                          "exit_reason, sl_price, target_price, status, pnl, notes) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING")
+            rows = lite.execute(select).fetchall()
+            if rows:
                 conn.executemany(insert, rows)
-        st.write(f"paper_trades: {len(rows)} rows processed")
+            st.write(f"paper_trades: {len(rows)} rows")
 
-        # --- paper_account ---
-        progress.progress(92, text="Migrating paper_account...")
-        rows = lite.execute(
-            "SELECT id, initial_capital, realized_pnl, total_trades, "
-            "winning_trades, created_at FROM paper_account"
-        ).fetchall()
-        if rows:
-            with _connect() as conn:
-                for row in rows:
-                    conn.execute(
-                        "INSERT INTO paper_account (id, initial_capital, realized_pnl, "
-                        "total_trades, winning_trades, created_at) "
-                        "VALUES (?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING", row
-                    )
-        st.write(f"paper_account: {len(rows)} rows processed")
+            # --- paper_account ---
+            progress.progress(90, text="Migrating paper_account...")
+            rows = lite.execute(
+                "SELECT id, initial_capital, realized_pnl, total_trades, "
+                "winning_trades, created_at FROM paper_account"
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO paper_account (id, initial_capital, realized_pnl, "
+                    "total_trades, winning_trades, created_at) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING", row
+                )
+            st.write(f"paper_account: {len(rows)} rows")
 
-        # --- Verify ---
-        progress.progress(100, text="Verifying...")
-        with _connect() as conn:
+            # --- Verify ---
+            progress.progress(100, text="Verifying...")
             for table in ["option_snapshots", "spot_snapshots", "paper_trades", "paper_account"]:
                 count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 st.write(f"PostgreSQL `{table}`: **{count}** rows")

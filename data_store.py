@@ -112,8 +112,34 @@ class _PgConn:
         return cur
 
     def executemany(self, sql, params_list):
+        """Bulk insert using execute_values for speed (100x faster than row-by-row)."""
+        from psycopg2.extras import execute_values
         cur = self._conn.cursor()
-        cur.executemany(self._q(sql), [self._cast(p) for p in params_list])
+        # Convert "INSERT INTO ... VALUES (%s, %s, ...)" → template for execute_values
+        pg_sql = self._q(sql)
+        # Split at VALUES to get the insert part and the template
+        upper = pg_sql.upper()
+        idx = upper.find("VALUES")
+        if idx == -1:
+            # Fallback to row-by-row for non-INSERT statements
+            cur.executemany(pg_sql, [self._cast(p) for p in params_list])
+            return cur
+        insert_part = pg_sql[:idx]
+        # Build template from param count: (%s, %s, ...)
+        ncols = len(params_list[0]) if params_list else 0
+        template = "(" + ",".join(["%s"] * ncols) + ")"
+        # Find ON CONFLICT clause if present
+        conflict = ""
+        conflict_idx = upper.find("ON CONFLICT")
+        if conflict_idx != -1:
+            conflict = " " + pg_sql[conflict_idx:]
+        execute_values(
+            cur,
+            insert_part + "VALUES %s" + conflict,
+            [self._cast(p) for p in params_list],
+            template=template,
+            page_size=2000,
+        )
         return cur
 
     def executescript(self, sql):
