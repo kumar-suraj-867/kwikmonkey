@@ -1892,13 +1892,8 @@ def render_market_intelligence(df: pd.DataFrame, spot: float, pcr_data: dict,
 # Main
 # ======================================================================
 
-def render_dashboard(fetcher: FyersDataFetcher):
+def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     """Render the live dashboard tab content."""
-    settings = render_sidebar(fetcher)
-
-    # Store refresh interval for main() to pick up on next cycle
-    st.session_state["_refresh_sec"] = settings["refresh_sec"]
-
     # Fetch data via shared cache (avoids duplicate calls across tabs)
     data = _fetch_shared_data(fetcher, settings["strike_count"],
                               settings["selected_expiry_ts"])
@@ -1978,13 +1973,17 @@ def main():
         options_symbol=profile["options_symbol"],
     )
 
+    # Sidebar must render outside the fragment (fragments can't write to sidebar)
+    settings = render_sidebar(fetcher)
+    st.session_state["_refresh_sec"] = settings["refresh_sec"]
+
     # Dashboard uses st.fragment for auto-refresh without freezing the whole page
     with tab_dashboard:
-        refresh_sec = st.session_state.get("_refresh_sec", config.REFRESH_INTERVAL_SEC)
+        refresh_sec = settings["refresh_sec"]
 
         @st.fragment(run_every=timedelta(seconds=refresh_sec))
         def _live_dashboard():
-            render_dashboard(fetcher)
+            render_dashboard(fetcher, settings)
 
         _live_dashboard()
 
