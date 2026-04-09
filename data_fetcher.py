@@ -1,7 +1,8 @@
 """Fetch option chain and market data from Fyers API."""
 
+import calendar
 import re
-from datetime import datetime
+from datetime import datetime, date
 
 import pandas as pd
 from fyers_apiv3 import fyersModel
@@ -193,3 +194,78 @@ class FyersDataFetcher:
         df["oi_change"] = df["oi"] - df["prev_oi"]
         df["spread"] = df["ask"] - df["bid"]
         return df, expiry_data
+
+    # ------------------------------------------------------------------
+    # VIX
+    # ------------------------------------------------------------------
+
+    def get_vix_quote(self) -> dict:
+        """Return India VIX quote."""
+        resp = self.fyers.quotes({"symbols": config.VIX_SYMBOL})
+        if resp.get("code") != 200 and resp.get("s") != "ok":
+            raise RuntimeError(f"VIX quotes error: {resp}")
+        d = resp["d"][0]["v"]
+        return {
+            "ltp": d.get("lp", 0),
+            "change": d.get("ch", 0),
+            "change_pct": d.get("chp", 0),
+            "open": d.get("open_price", 0),
+            "high": d.get("high_price", 0),
+            "low": d.get("low_price", 0),
+            "prev_close": d.get("prev_close_price", 0),
+        }
+
+    # ------------------------------------------------------------------
+    # Futures
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _futures_symbol(prefix: str, dt: date = None) -> str:
+        """Build futures symbol like NSE:NIFTY26APRFUT."""
+        dt = dt or date.today()
+        yy = dt.strftime("%y")
+        mmm = dt.strftime("%b").upper()
+        return f"{prefix}{yy}{mmm}FUT"
+
+    def get_futures_quote(self, futures_prefix: str = None) -> dict | None:
+        """Return near-month futures quote with OI.
+
+        Tries current month; if that fails (expired), tries next month.
+        """
+        prefix = futures_prefix or "NSE:NIFTY"
+        today = date.today()
+        symbols_to_try = [
+            self._futures_symbol(prefix, today),
+        ]
+        # Add next month
+        if today.month == 12:
+            next_month = today.replace(year=today.year + 1, month=1, day=1)
+        else:
+            next_month = today.replace(month=today.month + 1, day=1)
+        symbols_to_try.append(self._futures_symbol(prefix, next_month))
+
+        for sym in symbols_to_try:
+            try:
+                resp = self.fyers.quotes({"symbols": sym})
+                if resp.get("s") != "ok" and resp.get("code") != 200:
+                    continue
+                d = resp["d"][0]["v"]
+                oi = d.get("open_interest", d.get("oi", 0))
+                ltp = d.get("lp", 0)
+                if ltp <= 0:
+                    continue
+                return {
+                    "symbol": sym,
+                    "ltp": ltp,
+                    "change": d.get("ch", 0),
+                    "change_pct": d.get("chp", 0),
+                    "open": d.get("open_price", 0),
+                    "high": d.get("high_price", 0),
+                    "low": d.get("low_price", 0),
+                    "prev_close": d.get("prev_close_price", 0),
+                    "volume": d.get("volume", 0),
+                    "oi": oi,
+                }
+            except Exception:
+                continue
+        return None

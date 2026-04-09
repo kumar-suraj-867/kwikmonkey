@@ -92,3 +92,9 @@ class HistoryFetcher:
                            resolution: str = "15") -> pd.DataFrame:
         """Fetch candles for an individual option contract."""
         return self.get_candles(symbol, from_date, to_date, resolution)
+
+    def get_vix_candles(self, from_date: str, to_date: str,
+                        resolution: str = "15") -> pd.DataFrame:
+        """Fetch India VIX candles."""
+        import config
+        return self.get_candles(config.VIX_SYMBOL, from_date, to_date, resolution)

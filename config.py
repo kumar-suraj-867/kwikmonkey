@@ -31,6 +31,7 @@ REFRESH_INTERVAL_SEC = int(_get_secret("REFRESH_INTERVAL_SEC", "30"))
 # Symbols
 NIFTY_UNDERLYING = "NSE:NIFTY50-INDEX"
 NIFTY_OPTIONS_SYMBOL = "NSE:NIFTY50-INDEX"
+VIX_SYMBOL = "NSE:INDIAVIX-INDEX"
 
 # NIFTY option parameters
 NIFTY_LOT_SIZE = 65
@@ -42,6 +43,7 @@ INDEX_PROFILES = {
         "name": "NIFTY 50",
         "underlying": "NSE:NIFTY50-INDEX",
         "options_symbol": "NSE:NIFTY50-INDEX",
+        "futures_prefix": "NSE:NIFTY",
         "lot_size": 65,
         "strike_step": 50,
         "expiry_weekday": 3,  # Thursday
@@ -50,6 +52,7 @@ INDEX_PROFILES = {
         "name": "SENSEX",
         "underlying": "BSE:SENSEX-INDEX",
         "options_symbol": "BSE:SENSEX-INDEX",
+        "futures_prefix": "BSE:SENSEX",
         "lot_size": 10,
         "strike_step": 100,
         "expiry_weekday": 4,  # Friday

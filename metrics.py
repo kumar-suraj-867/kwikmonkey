@@ -215,6 +215,50 @@ def calculate_pcr(df: pd.DataFrame) -> dict:
     }
 
 
+def calculate_futures_basis(spot_ltp: float, futures_ltp: float,
+                           days_to_expiry: float) -> dict:
+    """Compute futures basis (premium/discount) vs spot."""
+    basis = futures_ltp - spot_ltp
+    basis_pct = (basis / spot_ltp * 100) if spot_ltp > 0 else 0
+    annualized = (basis_pct * 365 / days_to_expiry) if days_to_expiry > 0 else 0
+    return {
+        "basis": round(basis, 2),
+        "basis_pct": round(basis_pct, 3),
+        "annualized_pct": round(annualized, 2),
+        "status": "Premium" if basis >= 0 else "Discount",
+    }
+
+
+def compare_expiry_oi(chain1: pd.DataFrame, chain2: pd.DataFrame,
+                      label1: str = "Weekly", label2: str = "Monthly") -> dict:
+    """Compare OI across two expiry chains.
+
+    Returns per-strike comparison data and aggregate metrics.
+    """
+    def _agg(df):
+        ce = df[df["option_type"] == "CE"]
+        pe = df[df["option_type"] == "PE"]
+        return {
+            "ce_oi": ce.set_index("strike")["oi"].to_dict(),
+            "pe_oi": pe.set_index("strike")["oi"].to_dict(),
+            "total_ce_oi": int(ce["oi"].sum()),
+            "total_pe_oi": int(pe["oi"].sum()),
+            "pcr": round(pe["oi"].sum() / ce["oi"].sum(), 3) if ce["oi"].sum() > 0 else 0,
+        }
+
+    agg1 = _agg(chain1) if not chain1.empty else {"ce_oi": {}, "pe_oi": {}, "total_ce_oi": 0, "total_pe_oi": 0, "pcr": 0}
+    agg2 = _agg(chain2) if not chain2.empty else {"ce_oi": {}, "pe_oi": {}, "total_ce_oi": 0, "total_pe_oi": 0, "pcr": 0}
+
+    all_strikes = sorted(set(list(agg1["ce_oi"].keys()) + list(agg1["pe_oi"].keys()) +
+                              list(agg2["ce_oi"].keys()) + list(agg2["pe_oi"].keys())))
+    return {
+        "strikes": all_strikes,
+        label1: agg1,
+        label2: agg2,
+        "labels": (label1, label2),
+    }
+
+
 def calculate_max_pain(df: pd.DataFrame) -> float:
     """Find the strike where total option buyers' loss is maximized (writers' gain).
 

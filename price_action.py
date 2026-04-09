@@ -441,3 +441,129 @@ def _build_reasoning(trend: str, structure: str, pcr: float,
 
     parts.append(f"IV: {iv_regime}")
     return " | ".join(parts)
+
+
+# ======================================================================
+# Composite trade signal
+# ======================================================================
+
+def generate_composite_signal(
+    trend: dict, structure: dict, iv_ctx: dict,
+    pcr_oi: float, spot: float,
+    max_pain: float,
+    vix_ltp: float = None,
+    futures_basis: dict = None,
+) -> dict:
+    """Generate a weighted composite signal from -100 (bearish) to +100 (bullish).
+
+    Components and weights:
+    - Trend (25%): EMA alignment and price position
+    - OI/PCR (25%): Put-call ratio and max pain position
+    - Structure (15%): Swing highs/lows pattern
+    - IV/VIX (15%): Volatility regime
+    - Futures basis (10%): Premium = bullish, discount = bearish
+    - Mean reversion (10%): Spot vs max pain distance
+    """
+    components = []
+    score = 0.0
+
+    # --- 1. Trend (25%) ---
+    trend_score = 0
+    t = trend.get("trend", "UNKNOWN")
+    strength = trend.get("strength", 0)
+    if "UPTREND" in t:
+        trend_score = min(strength * 25, 100)
+    elif "DOWNTREND" in t:
+        trend_score = -min(strength * 25, 100)
+    components.append({"name": "Trend", "score": trend_score, "weight": 25,
+                       "detail": f"{t} (strength {strength})"})
+    score += trend_score * 0.25
+
+    # --- 2. OI / PCR (25%) ---
+    pcr_score = 0
+    if pcr_oi > 1.3:
+        pcr_score = min((pcr_oi - 1.0) * 100, 100)
+    elif pcr_oi < 0.7:
+        pcr_score = max((pcr_oi - 1.0) * 100, -100)
+    else:
+        pcr_score = (pcr_oi - 1.0) * 100
+    components.append({"name": "PCR/OI", "score": round(pcr_score), "weight": 25,
+                       "detail": f"PCR {pcr_oi:.2f}"})
+    score += pcr_score * 0.25
+
+    # --- 3. Structure (15%) ---
+    struct_score = 0
+    s = structure.get("pattern", "UNKNOWN")
+    if "BULLISH" in s:
+        struct_score = 60
+    elif "BEARISH" in s:
+        struct_score = -60
+    elif "EXPAND" in s:
+        struct_score = 20 if "UPTREND" in t else -20
+    components.append({"name": "Structure", "score": struct_score, "weight": 15,
+                       "detail": s})
+    score += struct_score * 0.15
+
+    # --- 4. IV / VIX (15%) ---
+    iv_score = 0
+    regime = iv_ctx.get("regime", "UNKNOWN") if iv_ctx else "UNKNOWN"
+    if regime == "LOW":
+        iv_score = 30  # cheap options, favor buying
+    elif regime == "HIGH":
+        iv_score = -30  # expensive options, favor selling
+    elif regime == "ELEVATED":
+        iv_score = -15
+    if vix_ltp is not None:
+        if vix_ltp > 20:
+            iv_score -= 20  # high fear
+        elif vix_ltp < 13:
+            iv_score += 15  # low fear / complacency
+    components.append({"name": "IV/VIX", "score": round(iv_score), "weight": 15,
+                       "detail": f"Regime: {regime}" + (f", VIX: {vix_ltp:.1f}" if vix_ltp else "")})
+    score += iv_score * 0.15
+
+    # --- 5. Futures basis (10%) ---
+    basis_score = 0
+    if futures_basis:
+        bp = futures_basis.get("basis_pct", 0)
+        if bp > 0.1:
+            basis_score = min(bp * 200, 80)
+        elif bp < -0.1:
+            basis_score = max(bp * 200, -80)
+        components.append({"name": "Futures", "score": round(basis_score), "weight": 10,
+                           "detail": f"{futures_basis['status']} {bp:+.3f}%"})
+    else:
+        components.append({"name": "Futures", "score": 0, "weight": 10, "detail": "N/A"})
+    score += basis_score * 0.10
+
+    # --- 6. Spot vs Max Pain (10%) ---
+    mp_score = 0
+    if max_pain > 0 and spot > 0:
+        dist_pct = (spot - max_pain) / max_pain * 100
+        # Spot above max pain = bearish pull-down expected, below = bullish pull-up
+        mp_score = max(min(-dist_pct * 20, 80), -80)
+        components.append({"name": "Max Pain", "score": round(mp_score), "weight": 10,
+                           "detail": f"Spot {dist_pct:+.1f}% from MP {max_pain:.0f}"})
+    else:
+        components.append({"name": "Max Pain", "score": 0, "weight": 10, "detail": "N/A"})
+    score += mp_score * 0.10
+
+    # --- Composite ---
+    total = round(max(min(score, 100), -100))
+
+    if total >= 50:
+        bias = "STRONG_BUY"
+    elif total >= 20:
+        bias = "BUY"
+    elif total <= -50:
+        bias = "STRONG_SELL"
+    elif total <= -20:
+        bias = "SELL"
+    else:
+        bias = "NEUTRAL"
+
+    return {
+        "score": total,
+        "bias": bias,
+        "components": components,
+    }

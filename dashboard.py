@@ -14,13 +14,14 @@ from auth import get_valid_token, run_auth_flow, load_token, validate_token, sav
 from backtest_ui import render_backtest_tab
 from paper_trading_ui import render_paper_trading_tab
 from data_fetcher import FyersDataFetcher
-from metrics import enrich_with_greeks, calculate_pcr, calculate_max_pain
+from metrics import enrich_with_greeks, calculate_pcr, calculate_max_pain, calculate_futures_basis, compare_expiry_oi
 from history_fetcher import HistoryFetcher
 import data_store
 from price_action import (
     detect_trend, detect_structure, compute_iv_context,
-    generate_entry_signals,
+    generate_entry_signals, generate_composite_signal,
 )
+from plotly.subplots import make_subplots
 
 # ======================================================================
 # Page config
@@ -532,6 +533,290 @@ def render_volume_price(df: pd.DataFrame, spot: float):
             margin=dict(t=40, b=40), uirevision="persistent",
         )
         st.plotly_chart(fig2, key="spread_curve", width="stretch")
+
+
+# ======================================================================
+# VIX Overlay
+# ======================================================================
+
+def _get_cached_vix_candles(fetcher: FyersDataFetcher) -> pd.DataFrame:
+    """Fetch 15-min VIX candles (past 5 days), cached 5 minutes."""
+    cache_key = "_vix_candles"
+    cache_ts_key = "_vix_candles_ts"
+    now = datetime.now()
+    cached_ts = st.session_state.get(cache_ts_key)
+    if cached_ts and (now - cached_ts).total_seconds() < 300:
+        cached = st.session_state.get(cache_key)
+        if cached is not None and not cached.empty:
+            return cached
+    try:
+        history = HistoryFetcher(fetcher.fyers, underlying=fetcher.underlying)
+        from_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        candles = history.get_vix_candles(from_date, to_date, resolution="15")
+        if not candles.empty:
+            st.session_state[cache_key] = candles
+            st.session_state[cache_ts_key] = now
+        return candles
+    except Exception:
+        return pd.DataFrame()
+
+
+def render_spot_vix_chart(spot_candles: pd.DataFrame, vix_candles: pd.DataFrame,
+                          vix_quote: dict = None):
+    """Render dual-axis chart: spot candlestick + VIX line overlay."""
+    st.subheader("Spot Price & India VIX")
+
+    if spot_candles.empty:
+        st.info("No spot candle data available.")
+        return
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Spot candlestick
+    fig.add_trace(
+        go.Candlestick(
+            x=spot_candles["timestamp"],
+            open=spot_candles["open"], high=spot_candles["high"],
+            low=spot_candles["low"], close=spot_candles["close"],
+            name="Spot", increasing_line_color="#26a69a",
+            decreasing_line_color="#ef5350",
+        ),
+        secondary_y=False,
+    )
+
+    # VIX line
+    if not vix_candles.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=vix_candles["timestamp"], y=vix_candles["close"],
+                name="India VIX", line=dict(color="#ffab40", width=2),
+            ),
+            secondary_y=True,
+        )
+
+    fig.update_layout(
+        template="plotly_dark", height=450,
+        margin=dict(t=30, b=30),
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        uirevision="spot_vix",
+    )
+    fig.update_yaxes(title_text="Spot Price", secondary_y=False)
+    fig.update_yaxes(title_text="India VIX", secondary_y=True)
+    st.plotly_chart(fig, key="spot_vix_chart", use_container_width=True)
+
+    # VIX metrics row
+    if vix_quote:
+        c1, c2, c3, c4 = st.columns(4)
+        vix_color = "red" if vix_quote["ltp"] > 20 else ("orange" if vix_quote["ltp"] > 15 else "green")
+        c1.metric("VIX", f"{vix_quote['ltp']:.2f}", f"{vix_quote['change']:+.2f}")
+        c2.metric("VIX Day Range", f"{vix_quote['low']:.1f} – {vix_quote['high']:.1f}")
+        zone = "High Fear" if vix_quote["ltp"] > 20 else ("Normal" if vix_quote["ltp"] > 13 else "Low / Complacent")
+        c3.metric("Fear Zone", zone)
+        c4.metric("Prev Close", f"{vix_quote['prev_close']:.2f}")
+
+
+# ======================================================================
+# Futures Data
+# ======================================================================
+
+def render_futures_data(spot_ltp: float, futures_data: dict, days_to_expiry: float):
+    """Render futures premium/discount, OI, and volume."""
+    st.subheader("Futures Data")
+
+    if not futures_data:
+        st.info("Futures data unavailable.")
+        return
+
+    basis = calculate_futures_basis(spot_ltp, futures_data["ltp"], days_to_expiry)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Futures LTP", f"₹{futures_data['ltp']:,.2f}", f"{futures_data['change']:+.2f}")
+
+    basis_color = "normal" if basis["basis"] >= 0 else "inverse"
+    c2.metric("Basis", f"₹{basis['basis']:+.2f}", f"{basis['basis_pct']:+.3f}%",
+              delta_color=basis_color)
+    c3.metric("Annualized", f"{basis['annualized_pct']:+.2f}%")
+    c4.metric("Futures OI", f"{futures_data['oi']:,}" if futures_data["oi"] else "N/A")
+    c5.metric("Volume", f"{futures_data['volume']:,}" if futures_data["volume"] else "N/A")
+
+    # Interpretation
+    if basis["basis_pct"] > 0.05:
+        st.caption(f"**{basis['status']}** — Bullish demand for leveraged long exposure")
+    elif basis["basis_pct"] < -0.05:
+        st.caption(f"**{basis['status']}** — Bearish sentiment or near-expiry convergence")
+    else:
+        st.caption("Basis near flat — no strong directional signal from futures")
+
+
+# ======================================================================
+# Multi-Expiry OI Comparison
+# ======================================================================
+
+def _classify_expiry(date_str: str, expiry_weekday: int) -> str:
+    """Classify an expiry date as 'Weekly' or 'Monthly'.
+
+    Monthly = last occurrence of expiry_weekday in the month.
+    """
+    from datetime import datetime as _dt
+    import calendar
+    try:
+        dt = _dt.strptime(date_str, "%d-%m-%Y")
+    except ValueError:
+        return "Weekly"
+    last_day = calendar.monthrange(dt.year, dt.month)[1]
+    # Find last expiry_weekday of the month
+    d = dt.replace(day=last_day)
+    while d.weekday() != expiry_weekday:
+        d = d.replace(day=d.day - 1)
+    return "Monthly" if dt.date() == d.date() else "Weekly"
+
+
+def render_multi_expiry_oi(fetcher: FyersDataFetcher, expiry_list: list[dict]):
+    """Render OI comparison between nearest weekly and monthly expiries."""
+    st.subheader("Multi-Expiry OI Comparison")
+
+    if not expiry_list or len(expiry_list) < 2:
+        st.info("Need at least 2 expiries for comparison.")
+        return
+
+    profile = _active_profile()
+    weekday = profile.get("expiry_weekday", 3)
+
+    # Classify expiries
+    classified = []
+    for e in expiry_list:
+        kind = _classify_expiry(e["date"], weekday)
+        classified.append({**e, "kind": kind})
+
+    # Pick first weekly and first monthly
+    weekly = next((e for e in classified if e["kind"] == "Weekly"), None)
+    monthly = next((e for e in classified if e["kind"] == "Monthly"), None)
+
+    if not weekly or not monthly:
+        # If all are monthly or all weekly, compare first two
+        weekly = classified[0]
+        monthly = classified[1] if len(classified) > 1 else classified[0]
+
+    if weekly["expiry"] == monthly["expiry"]:
+        # Same expiry, compare first two distinct ones
+        weekly = classified[0]
+        monthly = classified[1] if len(classified) > 1 else classified[0]
+
+    label1 = f"{weekly['date']} ({weekly.get('kind', 'Near')})"
+    label2 = f"{monthly['date']} ({monthly.get('kind', 'Far')})"
+
+    # Fetch second chain (first is already cached from main data)
+    cache_key = f"_multi_oi_{monthly['expiry']}"
+    cache_ts_key = f"_multi_oi_ts_{monthly['expiry']}"
+    now = datetime.now()
+    cached_ts = st.session_state.get(cache_ts_key)
+
+    chain2 = pd.DataFrame()
+    if cached_ts and (now - cached_ts).total_seconds() < 300:
+        chain2 = st.session_state.get(cache_key, pd.DataFrame())
+
+    if chain2.empty:
+        try:
+            chain2 = fetcher.get_option_chain(expiry_ts=monthly["expiry"])
+            st.session_state[cache_key] = chain2
+            st.session_state[cache_ts_key] = now
+        except Exception:
+            st.warning("Failed to fetch second expiry chain.")
+            return
+
+    # Get chain1 (nearest, already fetched)
+    chain1 = st.session_state.get("_enriched_chain", pd.DataFrame())
+    if chain1.empty:
+        return
+
+    comparison = compare_expiry_oi(chain1, chain2, label1, label2)
+
+    # Summary metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(f"{label1} PCR", f"{comparison[label1]['pcr']:.2f}")
+    c2.metric(f"{label2} PCR", f"{comparison[label2]['pcr']:.2f}")
+    c1.metric(f"{label1} Total OI", f"{comparison[label1]['total_ce_oi'] + comparison[label1]['total_pe_oi']:,}")
+    c2.metric(f"{label2} Total OI", f"{comparison[label2]['total_ce_oi'] + comparison[label2]['total_pe_oi']:,}")
+
+    # Grouped bar chart
+    strikes = comparison["strikes"]
+    if not strikes:
+        return
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=strikes, y=[comparison[label1]["ce_oi"].get(s, 0) for s in strikes],
+        name=f"CE OI ({label1})", marker_color="rgba(239,83,80,0.6)",
+    ))
+    fig.add_trace(go.Bar(
+        x=strikes, y=[comparison[label2]["ce_oi"].get(s, 0) for s in strikes],
+        name=f"CE OI ({label2})", marker_color="rgba(239,83,80,1.0)",
+    ))
+    fig.add_trace(go.Bar(
+        x=strikes, y=[comparison[label1]["pe_oi"].get(s, 0) for s in strikes],
+        name=f"PE OI ({label1})", marker_color="rgba(38,166,154,0.6)",
+    ))
+    fig.add_trace(go.Bar(
+        x=strikes, y=[comparison[label2]["pe_oi"].get(s, 0) for s in strikes],
+        name=f"PE OI ({label2})", marker_color="rgba(38,166,154,1.0)",
+    ))
+    fig.update_layout(
+        barmode="group", template="plotly_dark", height=400,
+        xaxis_title="Strike", yaxis_title="Open Interest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        margin=dict(t=40, b=40), uirevision="multi_oi",
+    )
+    st.plotly_chart(fig, key="multi_expiry_oi", use_container_width=True)
+
+
+# ======================================================================
+# Composite Signal Dashboard
+# ======================================================================
+
+def render_signal_dashboard(signal: dict):
+    """Render the composite trade signal with gauge and component breakdown."""
+    st.subheader("Trade Signal")
+
+    score = signal["score"]
+    bias = signal["bias"]
+
+    # Gauge chart
+    color = ("#26a69a" if score > 20 else "#ef5350" if score < -20 else "#ffab40")
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        title={"text": bias, "font": {"size": 20}},
+        number={"font": {"size": 40}},
+        gauge={
+            "axis": {"range": [-100, 100], "tickwidth": 1},
+            "bar": {"color": color},
+            "steps": [
+                {"range": [-100, -50], "color": "rgba(239,83,80,0.3)"},
+                {"range": [-50, -20], "color": "rgba(239,83,80,0.15)"},
+                {"range": [-20, 20], "color": "rgba(255,171,64,0.15)"},
+                {"range": [20, 50], "color": "rgba(38,166,154,0.15)"},
+                {"range": [50, 100], "color": "rgba(38,166,154,0.3)"},
+            ],
+            "threshold": {"line": {"color": "white", "width": 2}, "value": score},
+        },
+    ))
+    fig.update_layout(template="plotly_dark", height=250, margin=dict(t=50, b=10))
+    st.plotly_chart(fig, key="signal_gauge", use_container_width=True)
+
+    # Component breakdown
+    cols = st.columns(len(signal["components"]))
+    for i, comp in enumerate(signal["components"]):
+        with cols[i]:
+            c_color = "normal" if comp["score"] >= 0 else "inverse"
+            st.metric(
+                comp["name"],
+                f"{comp['score']:+d}",
+                f"wt: {comp['weight']}%",
+                delta_color=c_color,
+            )
+            st.caption(comp["detail"])
 
 
 # ======================================================================
@@ -1938,11 +2223,42 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     _live_spot()
     st.divider()
 
+    # --- Fetch auxiliary data for new sections ---
+    spot_candles = _get_cached_spot_candles(fetcher)
+    vix_candles = _get_cached_vix_candles(fetcher)
+    vix_quote = None
+    try:
+        vix_quote = fetcher.get_vix_quote()
+    except Exception:
+        pass
+
+    profile = _active_profile()
+    futures_data = None
+    try:
+        futures_data = fetcher.get_futures_quote(
+            futures_prefix=profile.get("futures_prefix"))
+    except Exception:
+        pass
+
+    days_to_expiry = T * 365.25
+
+    # --- Spot + VIX overlay chart ---
+    render_spot_vix_chart(spot_candles, vix_candles, vix_quote)
+    st.divider()
+
+    # --- Futures basis/OI ---
+    render_futures_data(spot["ltp"], futures_data, days_to_expiry)
+    st.divider()
+
     # --- Heavy sections: rendered once per full page load ---
     render_option_chain_table(chain_df, spot["ltp"])
     st.divider()
 
     render_oi_analysis(chain_df, spot["ltp"])
+    st.divider()
+
+    # --- Multi-expiry OI comparison ---
+    render_multi_expiry_oi(fetcher, data["expiry_list"])
     st.divider()
 
     render_greeks(chain_df, spot["ltp"])
@@ -1951,8 +2267,32 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     render_volume_price(chain_df, spot["ltp"])
     st.divider()
 
+    # --- Composite trade signal ---
     pcr_data = calculate_pcr(chain_df)
-    spot_candles = _get_cached_spot_candles(fetcher)
+    max_pain = calculate_max_pain(chain_df)
+    trend = detect_trend(spot_candles) if not spot_candles.empty else {}
+    structure = detect_structure(spot_candles) if not spot_candles.empty else {}
+    iv_ctx = compute_iv_context(
+        chain_df, spot["ltp"], _get_historical_atm_iv(spot["ltp"])
+    )
+    futures_basis = None
+    if futures_data:
+        futures_basis = calculate_futures_basis(
+            spot["ltp"], futures_data["ltp"], days_to_expiry)
+
+    signal = generate_composite_signal(
+        trend=trend,
+        structure=structure,
+        iv_ctx=iv_ctx,
+        pcr_oi=pcr_data["pcr_oi"],
+        spot=spot["ltp"],
+        max_pain=max_pain,
+        vix_ltp=vix_quote["ltp"] if vix_quote else None,
+        futures_basis=futures_basis,
+    )
+    render_signal_dashboard(signal)
+    st.divider()
+
     render_market_intelligence(chain_df, spot["ltp"], pcr_data, spot_candles,
                                expiry_date=settings["selected_expiry_date"])
 
