@@ -115,10 +115,13 @@ def _fetch_shared_data(fetcher: FyersDataFetcher, strike_count: int,
 def check_auth() -> str | None:
     """Return valid token or show auth UI."""
     token = load_token()
-    if token and validate_token(token):
-        return token
-
-    st.warning("Fyers API token not found or expired. Please authenticate.")
+    if token:
+        valid, err = validate_token(token)
+        if valid:
+            return token
+        st.warning(f"Fyers token found but validation failed: {err}")
+    else:
+        st.warning("Fyers API token not found. Please authenticate.")
 
     with st.expander("Authentication", expanded=True):
         st.markdown("""

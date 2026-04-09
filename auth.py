@@ -68,26 +68,35 @@ def load_token() -> str | None:
     return None
 
 
-def validate_token(token: str) -> bool:
-    """Check if the token is still valid by making a profile request."""
-    fyers = fyersModel.FyersModel(
-        client_id=config.FYERS_APP_ID,
-        token=token,
-        is_async=False,
-        log_path="",
-    )
+def validate_token(token: str) -> tuple[bool, str]:
+    """Check if the token is still valid by making a profile request.
+
+    Returns (is_valid, error_message).
+    """
+    if not config.FYERS_APP_ID:
+        return False, "FYERS_APP_ID not set"
     try:
+        fyers = fyersModel.FyersModel(
+            client_id=config.FYERS_APP_ID,
+            token=token,
+            is_async=False,
+            log_path="",
+        )
         response = fyers.get_profile()
-        return response.get("s") == "ok"
-    except Exception:
-        return False
+        if response.get("s") == "ok":
+            return True, ""
+        return False, f"API response: {response.get('message', response)}"
+    except Exception as e:
+        return False, f"Exception: {e}"
 
 
 def get_valid_token() -> str | None:
     """Return a valid token if available, else None."""
     token = load_token()
-    if token and validate_token(token):
-        return token
+    if token:
+        valid, _ = validate_token(token)
+        if valid:
+            return token
     return None
 
 
