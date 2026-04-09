@@ -81,7 +81,7 @@ def _connect(db_path: str = DB_PATH):
     Uses PostgreSQL if DATABASE_URL is set, else SQLite.
     """
     if USE_POSTGRES:
-        conn = psycopg2.connect(_DATABASE_URL)
+        conn = psycopg2.connect(_DATABASE_URL, sslmode="require")
         try:
             yield _PgConn(conn)
             conn.commit()
