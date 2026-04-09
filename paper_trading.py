@@ -138,6 +138,14 @@ def place_order(expiry_date: str, strike: float, option_type: str,
     if not group_id:
         group_id = trade_id
 
+    # Cast numpy types to native Python (psycopg2 can't serialize np.float64)
+    strike = float(strike)
+    entry_price = float(entry_price)
+    lots = int(lots)
+    lot_size = int(lot_size)
+    sl_price = float(sl_price) if sl_price is not None else None
+    target_price = float(target_price) if target_price is not None else None
+
     with _connect(db_path) as conn:
         conn.execute("""
             INSERT INTO paper_trades
@@ -155,6 +163,7 @@ def close_position(trade_id: str, exit_price: float,
                    exit_reason: str = "manual",
                    db_path: str = DB_PATH) -> float:
     """Close an open trade. Returns realized P&L."""
+    exit_price = float(exit_price)
     init_paper_tables(db_path)
     with _connect(db_path) as conn:
         row = conn.execute(
@@ -166,7 +175,7 @@ def close_position(trade_id: str, exit_price: float,
 
         action, lots, entry_price, lot_size = row
         direction = 1 if action == "BUY" else -1
-        pnl = (exit_price - entry_price) * direction * lots * lot_size
+        pnl = float((exit_price - entry_price) * direction * lots * lot_size)
 
         conn.execute("""
             UPDATE paper_trades

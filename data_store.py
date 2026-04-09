@@ -65,7 +65,8 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "market_data.db")
 class _PgConn:
     """Wraps psycopg2 connection to behave like sqlite3 for our use patterns.
 
-    Translates ? → %s placeholders and provides execute/executemany/executescript.
+    Translates ? → %s placeholders and casts numpy types to native Python
+    (psycopg2 cannot serialize np.float64 / np.int64).
     """
 
     def __init__(self, conn):
@@ -75,14 +76,30 @@ class _PgConn:
     def _q(sql):
         return sql.replace("?", "%s")
 
+    @staticmethod
+    def _cast(params):
+        """Cast numpy scalars to native Python types."""
+        import numpy as np
+        out = []
+        for p in params:
+            if isinstance(p, (np.integer,)):
+                out.append(int(p))
+            elif isinstance(p, (np.floating,)):
+                out.append(float(p))
+            elif isinstance(p, np.bool_):
+                out.append(bool(p))
+            else:
+                out.append(p)
+        return tuple(out)
+
     def execute(self, sql, params=None):
         cur = self._conn.cursor()
-        cur.execute(self._q(sql), params or ())
+        cur.execute(self._q(sql), self._cast(params) if params else ())
         return cur
 
     def executemany(self, sql, params_list):
         cur = self._conn.cursor()
-        cur.executemany(self._q(sql), params_list)
+        cur.executemany(self._q(sql), [self._cast(p) for p in params_list])
         return cur
 
     def executescript(self, sql):
