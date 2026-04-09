@@ -53,9 +53,23 @@ USE_POSTGRES = bool(_DATABASE_URL and "postgres" in _DATABASE_URL)
 
 if USE_POSTGRES:
     import psycopg2
+    import psycopg2.pool
 
 # DB file lives next to the app (SQLite only)
 DB_PATH = os.path.join(os.path.dirname(__file__), "market_data.db")
+
+# Connection pool (PostgreSQL only) — reuses connections instead of
+# opening a fresh TCP+SSL handshake on every query.
+_pg_pool = None
+
+def _get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = psycopg2.pool.SimpleConnectionPool(
+            minconn=1, maxconn=5,
+            dsn=_DATABASE_URL, sslmode="require",
+        )
+    return _pg_pool
 
 
 # ======================================================================
@@ -117,10 +131,11 @@ class _PgConn:
 def _connect(db_path: str = DB_PATH):
     """Context manager yielding a connection wrapper.
 
-    Uses PostgreSQL if DATABASE_URL is set, else SQLite.
+    Uses PostgreSQL (pooled) if DATABASE_URL is set, else SQLite.
     """
     if USE_POSTGRES:
-        conn = psycopg2.connect(_DATABASE_URL, sslmode="require")
+        pool = _get_pg_pool()
+        conn = pool.getconn()
         try:
             yield _PgConn(conn)
             conn.commit()
@@ -128,7 +143,7 @@ def _connect(db_path: str = DB_PATH):
             conn.rollback()
             raise
         finally:
-            conn.close()
+            pool.putconn(conn)
     else:
         conn = sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -234,13 +249,19 @@ _DDL_POSTGRES = """
 """
 
 
+_db_initialized = False
+
 def init_db(db_path: str = DB_PATH):
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist. No-op after first call."""
+    global _db_initialized
+    if _db_initialized:
+        return
     with _connect(db_path) as conn:
         if USE_POSTGRES:
             conn.executescript(_DDL_POSTGRES)
         else:
             conn.executescript(_DDL_SQLITE)
+    _db_initialized = True
 
 
 # ======================================================================

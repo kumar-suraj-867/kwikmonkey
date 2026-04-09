@@ -56,8 +56,13 @@ _PAPER_DDL = """
 """
 
 
+_paper_initialized = False
+
 def init_paper_tables(db_path: str = DB_PATH):
-    """Create paper trading tables if they don't exist."""
+    """Create paper trading tables if they don't exist. No-op after first call."""
+    global _paper_initialized
+    if _paper_initialized:
+        return
     with _connect(db_path) as conn:
         conn.executescript(_PAPER_DDL)
         # Migration: add lot_size column to existing DBs
@@ -72,6 +77,7 @@ def init_paper_tables(db_path: str = DB_PATH):
                 conn.execute(
                     "ALTER TABLE paper_trades ADD COLUMN lot_size INTEGER NOT NULL DEFAULT 65"
                 )
+    _paper_initialized = True
 
 
 # ======================================================================
