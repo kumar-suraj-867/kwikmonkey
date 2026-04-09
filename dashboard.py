@@ -279,7 +279,6 @@ def render_spot_header(spot: dict, index_name: str = "NIFTY 50"):
 
 def render_option_chain_table(df: pd.DataFrame, spot: float):
     """Render the option chain as a merged CE | Strike | PE table."""
-    st.subheader("Option Chain")
 
     # Pick only the columns we need to avoid duplicates after enrich_with_greeks
     keep_cols = [
@@ -334,7 +333,6 @@ def render_option_chain_table(df: pd.DataFrame, spot: float):
 
 def render_oi_analysis(df: pd.DataFrame, spot: float):
     """PCR, max pain, and OI distribution charts."""
-    st.subheader("Open Interest Analysis")
 
     pcr = calculate_pcr(df)
     max_pain = calculate_max_pain(df)
@@ -409,7 +407,6 @@ def render_oi_analysis(df: pd.DataFrame, spot: float):
 
 def render_greeks(df: pd.DataFrame, spot: float):
     """Greeks heatmap and IV smile."""
-    st.subheader("Option Greeks & IV")
 
     col_left, col_right = st.columns(2)
 
@@ -484,7 +481,6 @@ def render_greeks(df: pd.DataFrame, spot: float):
 
 def render_volume_price(df: pd.DataFrame, spot: float):
     """Volume and bid-ask spread analysis."""
-    st.subheader("Volume & Spread Analysis")
 
     col_left, col_right = st.columns(2)
 
@@ -565,7 +561,6 @@ def _get_cached_vix_candles(fetcher: FyersDataFetcher) -> pd.DataFrame:
 def render_spot_vix_chart(spot_candles: pd.DataFrame, vix_candles: pd.DataFrame,
                           vix_quote: dict = None):
     """Render dual-axis chart: spot candlestick + VIX line overlay."""
-    st.subheader("Spot Price & India VIX")
 
     if spot_candles.empty:
         st.info("No spot candle data available.")
@@ -623,7 +618,6 @@ def render_spot_vix_chart(spot_candles: pd.DataFrame, vix_candles: pd.DataFrame,
 
 def render_futures_data(spot_ltp: float, futures_data: dict, days_to_expiry: float):
     """Render futures premium/discount, OI, and volume."""
-    st.subheader("Futures Data")
 
     if not futures_data:
         st.info("Futures data unavailable.")
@@ -675,7 +669,6 @@ def _classify_expiry(date_str: str, expiry_weekday: int) -> str:
 
 def render_multi_expiry_oi(fetcher: FyersDataFetcher, expiry_list: list[dict]):
     """Render OI comparison between nearest weekly and monthly expiries."""
-    st.subheader("Multi-Expiry OI Comparison")
 
     if not expiry_list or len(expiry_list) < 2:
         st.info("Need at least 2 expiries for comparison.")
@@ -777,7 +770,6 @@ def render_multi_expiry_oi(fetcher: FyersDataFetcher, expiry_list: list[dict]):
 
 def render_signal_dashboard(signal: dict):
     """Render the composite trade signal with gauge and component breakdown."""
-    st.subheader("Trade Signal")
 
     score = signal["score"]
     bias = signal["bias"]
@@ -2242,32 +2234,7 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
 
     days_to_expiry = T * 365.25
 
-    # --- Spot + VIX overlay chart ---
-    render_spot_vix_chart(spot_candles, vix_candles, vix_quote)
-    st.divider()
-
-    # --- Futures basis/OI ---
-    render_futures_data(spot["ltp"], futures_data, days_to_expiry)
-    st.divider()
-
-    # --- Heavy sections: rendered once per full page load ---
-    render_option_chain_table(chain_df, spot["ltp"])
-    st.divider()
-
-    render_oi_analysis(chain_df, spot["ltp"])
-    st.divider()
-
-    # --- Multi-expiry OI comparison ---
-    render_multi_expiry_oi(fetcher, data["expiry_list"])
-    st.divider()
-
-    render_greeks(chain_df, spot["ltp"])
-    st.divider()
-
-    render_volume_price(chain_df, spot["ltp"])
-    st.divider()
-
-    # --- Composite trade signal ---
+    # --- Compute shared data for signal + market intelligence ---
     pcr_data = calculate_pcr(chain_df)
     max_pain = calculate_max_pain(chain_df)
     trend = detect_trend(spot_candles) if not spot_candles.empty else {}
@@ -2279,30 +2246,46 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     atm_ce_iv = atm_calls["iv"].iloc[0] if not atm_calls.empty and "iv" in atm_calls.columns else 0
     atm_pe_iv = atm_puts["iv"].iloc[0] if not atm_puts.empty and "iv" in atm_puts.columns else 0
     atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 0
-
-    iv_ctx = compute_iv_context(
-        atm_iv, _get_historical_atm_iv(spot["ltp"])
-    )
+    iv_ctx = compute_iv_context(atm_iv, _get_historical_atm_iv(spot["ltp"]))
     futures_basis = None
     if futures_data:
         futures_basis = calculate_futures_basis(
             spot["ltp"], futures_data["ltp"], days_to_expiry)
-
     signal = generate_composite_signal(
-        trend=trend,
-        structure=structure,
-        iv_ctx=iv_ctx,
-        pcr_oi=pcr_data["pcr_oi"],
-        spot=spot["ltp"],
-        max_pain=max_pain,
+        trend=trend, structure=structure, iv_ctx=iv_ctx,
+        pcr_oi=pcr_data["pcr_oi"], spot=spot["ltp"], max_pain=max_pain,
         vix_ltp=vix_quote["ltp"] if vix_quote else None,
         futures_basis=futures_basis,
     )
-    render_signal_dashboard(signal)
-    st.divider()
 
-    render_market_intelligence(chain_df, spot["ltp"], pcr_data, spot_candles,
-                               expiry_date=settings["selected_expiry_date"])
+    # --- Collapsible sections ---
+    with st.expander("Trade Signal", expanded=True):
+        render_signal_dashboard(signal)
+
+    with st.expander("Spot Price & India VIX"):
+        render_spot_vix_chart(spot_candles, vix_candles, vix_quote)
+
+    with st.expander("Futures Data"):
+        render_futures_data(spot["ltp"], futures_data, days_to_expiry)
+
+    with st.expander("Option Chain"):
+        render_option_chain_table(chain_df, spot["ltp"])
+
+    with st.expander("Open Interest Analysis"):
+        render_oi_analysis(chain_df, spot["ltp"])
+
+    with st.expander("Multi-Expiry OI Comparison"):
+        render_multi_expiry_oi(fetcher, data["expiry_list"])
+
+    with st.expander("Option Greeks & IV"):
+        render_greeks(chain_df, spot["ltp"])
+
+    with st.expander("Volume & Spread Analysis"):
+        render_volume_price(chain_df, spot["ltp"])
+
+    with st.expander("Market Intelligence", expanded=True):
+        render_market_intelligence(chain_df, spot["ltp"], pcr_data, spot_candles,
+                                   expiry_date=settings["selected_expiry_date"])
 
 
 def main():
