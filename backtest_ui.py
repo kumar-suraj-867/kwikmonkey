@@ -108,10 +108,10 @@ def render_backtest_tab(fetcher: FyersDataFetcher):
             c1, c2, c3, c4 = st.columns(4)
             stop_loss_pct = c1.number_input("Stop-loss %", value=50.0, step=5.0, min_value=10.0, max_value=100.0)
             target_pct = c2.number_input("Target %", value=50.0, step=5.0, min_value=10.0, max_value=200.0)
-            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=1, min_value=1)
             days_before = c4.number_input("Entry days before expiry", value=4, step=1, min_value=1, max_value=7)
         elif holding_mode == "Overnight":
-            lot_size = st.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            lot_size = st.number_input("Lot size", value=_active_profile()["lot_size"], step=1, min_value=1)
             stop_loss_pct = 100  # no intraday SL for overnight
             target_pct = 100
             days_before = 4
@@ -120,7 +120,7 @@ def render_backtest_tab(fetcher: FyersDataFetcher):
             c1, c2, c3 = st.columns(3)
             stop_loss_pct = c1.number_input("Stop-loss %", value=50.0, step=5.0, min_value=10.0, max_value=100.0)
             target_pct = c2.number_input("Target %", value=50.0, step=5.0, min_value=10.0, max_value=200.0)
-            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=25, min_value=25)
+            lot_size = c3.number_input("Lot size", value=_active_profile()["lot_size"], step=1, min_value=1)
             days_before = 4  # not used in daily modes
 
         st.markdown("**Execution & pricing**")
