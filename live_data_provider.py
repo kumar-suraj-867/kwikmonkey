@@ -190,6 +190,12 @@ class LiveDataProvider:
             expiry_list = list(self._expiry_list)
             fetch_time = self._last_tick_time
 
+        # Cast int columns to float so WebSocket tick values (always float) can
+        # be assigned without dtype errors.
+        for col in ("volume", "oi", "prev_oi"):
+            if col in df.columns:
+                df[col] = df[col].astype(float)
+
         # Merge tick data into chain (outside lock for performance)
         for idx, row in df.iterrows():
             sym = row["symbol"]
