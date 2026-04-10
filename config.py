@@ -26,7 +26,7 @@ FYERS_REDIRECT_URI = _get_secret(
 # Market settings
 RISK_FREE_RATE = float(_get_secret("RISK_FREE_RATE", "0.07"))
 DEFAULT_STRIKE_COUNT = int(_get_secret("DEFAULT_STRIKE_COUNT", "15"))
-REFRESH_INTERVAL_SEC = int(_get_secret("REFRESH_INTERVAL_SEC", "30"))
+REFRESH_INTERVAL_SEC = float(_get_secret("REFRESH_INTERVAL_SEC", "1"))
 LIVE_DATA_STALE_SEC = int(_get_secret("LIVE_DATA_STALE_SEC", "10"))
 CHAIN_REST_REFRESH_SEC = int(_get_secret("CHAIN_REST_REFRESH_SEC", "60"))
 

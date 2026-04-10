@@ -177,15 +177,6 @@ def render_sidebar(fetcher: FyersDataFetcher) -> dict:
     with st.sidebar:
         st.title("⚙️ Settings")
 
-        # Refresh interval
-        refresh_sec = st.slider(
-            "Auto-refresh (seconds)",
-            min_value=3,
-            max_value=60,
-            value=config.REFRESH_INTERVAL_SEC,
-            step=1,
-        )
-
         # Strike count
         strike_count = st.slider(
             "Strikes (above & below ATM)",
@@ -222,7 +213,6 @@ def render_sidebar(fetcher: FyersDataFetcher) -> dict:
         st.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
 
     return {
-        "refresh_sec": refresh_sec,
         "strike_count": strike_count,
         "selected_expiry_ts": selected_expiry_ts,
         "selected_expiry_date": selected_expiry_date,
@@ -2201,9 +2191,7 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     st.session_state["_expiry_date"] = settings["selected_expiry_date"]
 
     # --- Live data header (auto-refreshes chain + spot via WebSocket) ---
-    refresh_sec = settings["refresh_sec"]
-
-    @st.fragment(run_every=timedelta(seconds=refresh_sec))
+    @st.fragment(run_every=timedelta(seconds=config.REFRESH_INTERVAL_SEC))
     def _live_data_refresh():
         provider = st.session_state.get("_live_data_provider")
         now = datetime.now()
