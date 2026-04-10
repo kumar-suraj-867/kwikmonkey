@@ -190,27 +190,40 @@ class LiveDataProvider:
             expiry_list = list(self._expiry_list)
             fetch_time = self._last_tick_time
 
-        # WebSocket binary protocol returns all values as floats.  Cast every
-        # numeric column so df.at assignments never hit an int64 ↔ float clash.
-        num_cols = df.select_dtypes(include=["int64", "int32"]).columns
-        df[num_cols] = df[num_cols].astype(float)
+        # Build a tick overlay DataFrame keyed by symbol, then merge.
+        # This avoids df.at single-cell assignment which raises TypeError
+        # when pandas refuses to cast float into an int64 block.
+        if tick_data:
+            # Map WebSocket field names → chain column names
+            field_map = {
+                "ltp": "ltp",
+                "bid_price": "bid",
+                "ask_price": "ask",
+                "vol_traded_today": "volume",
+                "open_price": "open",
+                "high_price": "high",
+                "low_price": "low",
+                "prev_close_price": "prev_close",
+                "ch": "change",
+                "chp": "change_pct",
+            }
+            tick_rows = []
+            for sym, tick in tick_data.items():
+                row = {"symbol": sym}
+                for ws_key, df_col in field_map.items():
+                    if ws_key in tick:
+                        row[df_col] = float(tick[ws_key])
+                tick_rows.append(row)
 
-        # Merge tick data into chain (outside lock for performance)
-        for idx, row in df.iterrows():
-            sym = row["symbol"]
-            if sym in tick_data:
-                tick = tick_data[sym]
-                df.at[idx, "ltp"] = tick.get("ltp", row["ltp"])
-                df.at[idx, "bid"] = tick.get("bid_price", row["bid"])
-                df.at[idx, "ask"] = tick.get("ask_price", row["ask"])
-                df.at[idx, "volume"] = tick.get("vol_traded_today", row["volume"])
-                df.at[idx, "open"] = tick.get("open_price", row["open"])
-                df.at[idx, "high"] = tick.get("high_price", row["high"])
-                df.at[idx, "low"] = tick.get("low_price", row["low"])
-                df.at[idx, "prev_close"] = tick.get("prev_close_price", row["prev_close"])
-                df.at[idx, "change"] = tick.get("ch", row["change"])
-                df.at[idx, "change_pct"] = tick.get("chp", row["change_pct"])
-                # iv and oi stay from base_chain (REST)
+            tick_df = pd.DataFrame(tick_rows)
+            # Update only columns present in tick data
+            update_cols = [c for c in tick_df.columns if c != "symbol" and c in df.columns]
+            if update_cols:
+                df = df.set_index("symbol")
+                tick_df = tick_df.set_index("symbol")
+                df[update_cols] = df[update_cols].astype(float)
+                df.update(tick_df[update_cols])
+                df = df.reset_index()
 
         # Recompute derived columns
         df["oi_change"] = df["oi"] - df["prev_oi"]
