@@ -22,6 +22,7 @@ from price_action import (
     generate_entry_signals, generate_composite_signal,
 )
 from plotly.subplots import make_subplots
+from live_data_provider import LiveDataProvider
 
 # ======================================================================
 # Page config
@@ -2199,20 +2200,66 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
     st.session_state["_expiry_data"] = data["expiry_list"]
     st.session_state["_expiry_date"] = settings["selected_expiry_date"]
 
-    # --- Live spot header (auto-refreshes without touching the rest) ---
+    # --- Live data header (auto-refreshes chain + spot via WebSocket) ---
     refresh_sec = settings["refresh_sec"]
 
     @st.fragment(run_every=timedelta(seconds=refresh_sec))
-    def _live_spot():
-        try:
-            live_spot = fetcher.get_spot_quote()
-            st.session_state["_spot"] = live_spot
-        except Exception:
-            live_spot = spot  # fallback to last known
-        render_spot_header(live_spot, index_name=_active_profile()["name"])
-        st.caption(f"Auto-updates every {refresh_sec}s  |  Last: {datetime.now().strftime('%H:%M:%S')}")
+    def _live_data_refresh():
+        provider = st.session_state.get("_live_data_provider")
+        now = datetime.now()
 
-    _live_spot()
+        if provider is None:
+            # No WebSocket — fall back to REST spot refresh
+            try:
+                live_spot = fetcher.get_spot_quote()
+                st.session_state["_spot"] = live_spot
+            except Exception:
+                live_spot = spot
+            render_spot_header(live_spot, index_name=_active_profile()["name"])
+            st.caption(f"REST mode  |  Last: {now.strftime('%H:%M:%S')}")
+            return
+
+        # Periodic REST refresh for IV, OI, and new strikes (~60s)
+        last_rest = st.session_state.get("_last_rest_refresh")
+        if last_rest is None or (now - last_rest).total_seconds() > config.CHAIN_REST_REFRESH_SEC:
+            try:
+                provider.refresh_chain(fetcher)
+                st.session_state["_last_rest_refresh"] = now
+            except Exception:
+                pass  # continue with cached data
+
+        latest = provider.get_latest()
+        if latest is not None and latest["spot"] is not None:
+            live_spot = latest["spot"]
+            live_chain = latest["chain_df"]
+
+            # Enrich with Greeks (in Streamlit thread — thread-safe)
+            T_now = time_to_expiry(settings["selected_expiry_date"]) if settings["selected_expiry_date"] else 1 / 365.25
+            enriched = enrich_with_greeks(live_chain, live_spot["ltp"], config.RISK_FREE_RATE, T_now)
+
+            # Push to session state for downstream consumers
+            st.session_state["_enriched_chain"] = enriched
+            st.session_state["_spot"] = live_spot
+            st.session_state["_expiry_data"] = latest["expiry_list"]
+            st.session_state["_last_chain_update"] = latest["fetch_time"]
+
+            render_spot_header(live_spot, index_name=_active_profile()["name"])
+
+            # Connection status
+            status = provider.status()
+            age = (now - latest["fetch_time"]).total_seconds() if latest["fetch_time"] else 999
+            if not status["connected"]:
+                st.warning("WebSocket disconnected — reconnecting...")
+            elif age > config.LIVE_DATA_STALE_SEC:
+                st.warning(f"Data is {int(age)}s old. Check connection.")
+            else:
+                st.caption(f"Live (WebSocket)  |  Last tick: {latest['fetch_time'].strftime('%H:%M:%S')}  |  {status['subscribed_count']} symbols")
+        else:
+            # Fallback to page-load data
+            render_spot_header(spot, index_name=_active_profile()["name"])
+            st.caption(f"Using initial data  |  {data['fetch_time'].strftime('%H:%M:%S')}")
+
+    _live_data_refresh()
     st.divider()
 
     # --- Fetch auxiliary data for new sections ---
@@ -2313,6 +2360,39 @@ def main():
     )
 
     settings = render_sidebar(fetcher)
+
+    # --- Live data provider (WebSocket) ---
+    provider_key = "_live_data_provider"
+    provider = st.session_state.get(provider_key)
+
+    # Stop and recreate if the underlying index changed
+    if provider is not None and provider._underlying != profile["underlying"]:
+        provider.stop()
+        provider = None
+        st.session_state.pop(provider_key, None)
+
+    if provider is None:
+        try:
+            provider = LiveDataProvider(
+                access_token=token,
+                underlying=profile["underlying"],
+                options_symbol=profile["options_symbol"],
+                strike_count=settings["strike_count"],
+                expiry_ts=settings["selected_expiry_ts"],
+                index_name=profile["name"],
+                futures_prefix=profile.get("futures_prefix"),
+            )
+            provider.start(fetcher)
+            st.session_state[provider_key] = provider
+        except Exception as e:
+            st.sidebar.warning(f"WebSocket init failed: {e}. Using REST fallback.")
+    else:
+        provider.update_params(
+            strike_count=settings["strike_count"],
+            expiry_ts=settings["selected_expiry_ts"],
+            index_name=profile["name"],
+            futures_prefix=profile.get("futures_prefix"),
+        )
 
     with tab_dashboard:
         render_dashboard(fetcher, settings)

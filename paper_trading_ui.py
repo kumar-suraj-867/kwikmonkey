@@ -38,6 +38,14 @@ def render_paper_trading_tab(fetcher: FyersDataFetcher):
     chain_df = st.session_state.get("_enriched_chain", pd.DataFrame())
     expiry_list = st.session_state.get("_expiry_data", [])
 
+    # Show data freshness
+    from datetime import datetime
+    last_update = st.session_state.get("_last_chain_update")
+    if last_update:
+        age = (datetime.now() - last_update).total_seconds()
+        if age > 15:
+            st.caption(f"⚠ Chain data is {int(age)}s old")
+
     # Fallback: fetch only if dashboard hasn't populated the cache yet
     if spot is None or chain_df.empty:
         try:
