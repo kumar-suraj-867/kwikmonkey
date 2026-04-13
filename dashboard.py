@@ -2269,58 +2269,68 @@ def render_dashboard(fetcher: FyersDataFetcher, settings: dict):
 
     days_to_expiry = T * 365.25
 
-    # --- Compute shared data for signal + market intelligence ---
-    pcr_data = calculate_pcr(chain_df)
-    max_pain = calculate_max_pain(chain_df)
-    trend = detect_trend(spot_candles) if not spot_candles.empty else {}
-    structure = detect_structure(spot_candles) if not spot_candles.empty else {}
-    strike_step = profile.get("strike_step", 50)
-    atm_strike = round(spot["ltp"] / strike_step) * strike_step
-    atm_calls = chain_df[(chain_df["strike"] == atm_strike) & (chain_df["option_type"] == "CE")]
-    atm_puts = chain_df[(chain_df["strike"] == atm_strike) & (chain_df["option_type"] == "PE")]
-    atm_ce_iv = atm_calls["iv"].iloc[0] if not atm_calls.empty and "iv" in atm_calls.columns else 0
-    atm_pe_iv = atm_puts["iv"].iloc[0] if not atm_puts.empty and "iv" in atm_puts.columns else 0
-    atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 0
-    iv_ctx = compute_iv_context(atm_iv, _get_historical_atm_iv(spot["ltp"]))
-    futures_basis = None
-    if futures_data:
-        futures_basis = calculate_futures_basis(
-            spot["ltp"], futures_data["ltp"], days_to_expiry)
-    signal = generate_composite_signal(
-        trend=trend, structure=structure, iv_ctx=iv_ctx,
-        pcr_oi=pcr_data["pcr_oi"], spot=spot["ltp"], max_pain=max_pain,
-        vix_ltp=vix_quote["ltp"] if vix_quote else None,
-        futures_basis=futures_basis,
-    )
+    # --- Live chain sections (auto-refresh from WebSocket data) ---
+    @st.fragment(run_every=timedelta(seconds=5))
+    def _live_chain_sections():
+        """Re-render chain-dependent sections using latest WebSocket data."""
+        live_chain = st.session_state.get("_enriched_chain", chain_df)
+        live_spot = st.session_state.get("_spot", spot)
+        live_spot_ltp = live_spot["ltp"] if isinstance(live_spot, dict) else live_spot
 
-    # --- Collapsible sections ---
-    with st.expander("Trade Signal", expanded=True):
-        render_signal_dashboard(signal)
+        # Compute shared data for signal + market intelligence
+        pcr_data = calculate_pcr(live_chain)
+        max_pain = calculate_max_pain(live_chain)
+        trend = detect_trend(spot_candles) if not spot_candles.empty else {}
+        structure = detect_structure(spot_candles) if not spot_candles.empty else {}
+        strike_step = profile.get("strike_step", 50)
+        atm_strike = round(live_spot_ltp / strike_step) * strike_step
+        atm_calls = live_chain[(live_chain["strike"] == atm_strike) & (live_chain["option_type"] == "CE")]
+        atm_puts = live_chain[(live_chain["strike"] == atm_strike) & (live_chain["option_type"] == "PE")]
+        atm_ce_iv = atm_calls["iv"].iloc[0] if not atm_calls.empty and "iv" in atm_calls.columns else 0
+        atm_pe_iv = atm_puts["iv"].iloc[0] if not atm_puts.empty and "iv" in atm_puts.columns else 0
+        atm_iv = (atm_ce_iv + atm_pe_iv) / 2 if (atm_ce_iv + atm_pe_iv) > 0 else 0
+        iv_ctx = compute_iv_context(atm_iv, _get_historical_atm_iv(live_spot_ltp))
+        futures_basis = None
+        if futures_data:
+            futures_basis = calculate_futures_basis(
+                live_spot_ltp, futures_data["ltp"], days_to_expiry)
+        signal = generate_composite_signal(
+            trend=trend, structure=structure, iv_ctx=iv_ctx,
+            pcr_oi=pcr_data["pcr_oi"], spot=live_spot_ltp, max_pain=max_pain,
+            vix_ltp=vix_quote["ltp"] if vix_quote else None,
+            futures_basis=futures_basis,
+        )
 
-    with st.expander("Spot Price & India VIX"):
-        render_spot_vix_chart(spot_candles, vix_candles, vix_quote)
+        # Collapsible sections
+        with st.expander("Trade Signal", expanded=True):
+            render_signal_dashboard(signal)
 
-    with st.expander("Futures Data"):
-        render_futures_data(spot["ltp"], futures_data, days_to_expiry)
+        with st.expander("Spot Price & India VIX"):
+            render_spot_vix_chart(spot_candles, vix_candles, vix_quote)
 
-    with st.expander("Option Chain"):
-        render_option_chain_table(chain_df, spot["ltp"])
+        with st.expander("Futures Data"):
+            render_futures_data(live_spot_ltp, futures_data, days_to_expiry)
 
-    with st.expander("Open Interest Analysis"):
-        render_oi_analysis(chain_df, spot["ltp"])
+        with st.expander("Option Chain"):
+            render_option_chain_table(live_chain, live_spot_ltp)
 
-    with st.expander("Multi-Expiry OI Comparison"):
-        render_multi_expiry_oi(fetcher, data["expiry_list"])
+        with st.expander("Open Interest Analysis"):
+            render_oi_analysis(live_chain, live_spot_ltp)
 
-    with st.expander("Option Greeks & IV"):
-        render_greeks(chain_df, spot["ltp"])
+        with st.expander("Multi-Expiry OI Comparison"):
+            render_multi_expiry_oi(fetcher, st.session_state.get("_expiry_data", data["expiry_list"]))
 
-    with st.expander("Volume & Spread Analysis"):
-        render_volume_price(chain_df, spot["ltp"])
+        with st.expander("Option Greeks & IV"):
+            render_greeks(live_chain, live_spot_ltp)
 
-    with st.expander("Market Intelligence", expanded=True):
-        render_market_intelligence(chain_df, spot["ltp"], pcr_data, spot_candles,
-                                   expiry_date=settings["selected_expiry_date"])
+        with st.expander("Volume & Spread Analysis"):
+            render_volume_price(live_chain, live_spot_ltp)
+
+        with st.expander("Market Intelligence", expanded=True):
+            render_market_intelligence(live_chain, live_spot_ltp, pcr_data, spot_candles,
+                                       expiry_date=settings["selected_expiry_date"])
+
+    _live_chain_sections()
 
 
 def main():
